@@ -66,7 +66,6 @@ class Migration(migrations.Migration):
             options={
                 "ordering": ["-created"],
             },
-            bases=("nautobot.apps.models.PrimaryModel",),
         ),
         migrations.CreateModel(
             name="DiscoveryResult",
@@ -157,6 +156,5 @@ class Migration(migrations.Migration):
             options={
                 "ordering": ["-created"],
             },
-            bases=("nautobot.apps.models.PrimaryModel",),
         ),
     ]

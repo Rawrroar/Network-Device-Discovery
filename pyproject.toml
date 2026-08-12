@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "nautobot-plugin-device-auto-discovery"
+version = "0.1.0"
+description = "A Nautobot plugin for automatic network device discovery via ICMP, SNMP, and SSH."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Developer", email = "dev@example.com"},
+]
+keywords = ["nautobot", "nautobot-app", "discovery", "snmp", "ssh"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "nautobot>=3.0,<4.0",
+    "pysnmp-leiden>=6.0",
+    "paramiko>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/nautobot-plugin-device-auto-discovery"
+Documentation = "https://github.com/your-org/nautobot-plugin-device-auto-discovery/docs"
+Source = "https://github.com/your-org/nautobot-plugin-device-auto-discovery"
+Issues = "https://github.com/your-org/nautobot-plugin-device-auto-discovery/issues"
+
+[project.entry-points."nautobot.apps"]
+nautobot_plugin_device_auto_discovery = "nautobot_plugin_device_auto_discovery"
+
+[tool.setuptools]
+packages = {find = {}}

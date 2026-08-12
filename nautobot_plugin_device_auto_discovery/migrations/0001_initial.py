@@ -1,5 +1,6 @@
 """Initial migration for DiscoveryScan and DiscoveryResult models."""
 
+import django.core.serializers.json
 import django.db.models.deletion
 from django.db import migrations, models
 
@@ -22,6 +23,7 @@ class Migration(migrations.Migration):
                 ("id", models.UUIDField(primary_key=True, serialize=False)),
                 ("created", models.DateTimeField(auto_now_add=True)),
                 ("last_updated", models.DateTimeField(auto_now=True)),
+                ("_custom_field_data", models.JSONField(encoder=django.core.serializers.json.DjangoJSONEncoder, blank=True, default=dict)),
                 ("name", models.CharField(help_text="Display name for this scan.", max_length=100)),
                 ("scan_method", models.CharField(
                     choices=[
@@ -73,6 +75,7 @@ class Migration(migrations.Migration):
                 ("id", models.UUIDField(primary_key=True, serialize=False)),
                 ("created", models.DateTimeField(auto_now_add=True)),
                 ("last_updated", models.DateTimeField(auto_now=True)),
+                ("_custom_field_data", models.JSONField(encoder=django.core.serializers.json.DjangoJSONEncoder, blank=True, default=dict)),
                 ("ip_address", models.GenericIPAddressField(
                     help_text="IP address of the discovered device.",
                     unpack_ipv4=False,

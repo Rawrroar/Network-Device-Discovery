@@ -22,7 +22,7 @@ from nautobot.apps.jobs import (
     StringVar,
     TextVar,
 )
-from nautobot.dcim.models import Device, DeviceRole, DeviceType, Location, LocationType, Manufacturer, Platform
+from nautobot.dcim.models import Device, DeviceType, Location, LocationType, Manufacturer, Platform, Role
 from nautobot.extras.models import Status, Tag
 
 from .models import DiscoveryScan, DiscoveryResult
@@ -58,8 +58,8 @@ def get_or_create_default_location(config):
 def get_or_create_default_role(config):
     """Get or create the default DeviceRole for discovered devices."""
     role_name = config.get("default_role", "Network Device")
-    status = Status.objects.get_for_model(DeviceRole).first()
-    role, _ = DeviceRole.objects.get_or_create(
+    status = Status.objects.get_for_model(Role).first()
+    role, _ = Role.objects.get_or_create(
         name=role_name,
         defaults={
             "color": "blue",

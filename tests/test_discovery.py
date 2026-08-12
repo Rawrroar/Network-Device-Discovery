@@ -4,7 +4,7 @@ from unittest.mock import patch, MagicMock
 
 from django.test import TestCase, TransactionTestCase
 from nautobot.extras.test_tools import run_job_for_testing
-from nautobot.dcim.models import Device, DeviceRole, DeviceType, Location, LocationType, Manufacturer, Platform
+from nautobot.dcim.models import Device, DeviceType, Location, LocationType, Manufacturer, Platform, Role
 from nautobot.extras.models import Status, Tag
 
 from nautobot_plugin_device_auto_discovery.mappings import lookup_platform_from_oid
@@ -79,8 +79,8 @@ class HelperFunctionTests(TestCase):
             location_type=cls.location_type,
             status=cls.location_status,
         )
-        cls.device_role_status = Status.objects.get_for_model(DeviceRole).first()
-        cls.device_role = DeviceRole.objects.create(
+        cls.device_role_status = Status.objects.get_for_model(Role).first()
+        cls.device_role = Role.objects.create(
             name="Test Role",
             color="red",
             status=cls.device_role_status,
@@ -224,8 +224,8 @@ class SNMPDiscoveryJobTests(TestCase):
             location_type=cls.location_type,
             status=cls.location_status,
         )
-        cls.device_role_status = Status.objects.get_for_model(DeviceRole).first()
-        cls.device_role = DeviceRole.objects.create(
+        cls.device_role_status = Status.objects.get_for_model(Role).first()
+        cls.device_role = Role.objects.create(
             name="SNMP Test Role",
             color="green",
             status=cls.device_role_status,
@@ -297,8 +297,8 @@ class SSHDiscoveryJobTests(TestCase):
             location_type=cls.location_type,
             status=cls.location_status,
         )
-        cls.device_role_status = Status.objects.get_for_model(DeviceRole).first()
-        cls.device_role = DeviceRole.objects.create(
+        cls.device_role_status = Status.objects.get_for_model(Role).first()
+        cls.device_role = Role.objects.create(
             name="SSH Test Role",
             color="purple",
             status=cls.device_role_status,
@@ -360,8 +360,8 @@ class FullDiscoveryJobTests(TestCase):
             location_type=cls.location_type,
             status=cls.location_status,
         )
-        cls.device_role_status = Status.objects.get_for_model(DeviceRole).first()
-        cls.device_role = DeviceRole.objects.create(
+        cls.device_role_status = Status.objects.get_for_model(Role).first()
+        cls.device_role = Role.objects.create(
             name="Full Test Role",
             color="orange",
             status=cls.device_role_status,

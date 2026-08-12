@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "nautobot>=3.0,<4.0",
-    "pysnmp-leiden>=6.0",
+    "pysnmp>=4.4",
     "paramiko>=3.0",
 ]
 

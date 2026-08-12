@@ -369,7 +369,7 @@ def snmp_get(ip_str, oid, community="public", timeout=3, retries=2, version="2c"
         string value or None.
     """
     try:
-        from pysnmp.hlapi.v2arch import (
+        from pysnmp.hlapi import (
             SnmpEngine,
             CommunityData,
             UdpTransportTarget,

@@ -11,8 +11,8 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        ("dcim", "0158_populated_computed_fields"),
-        ("extras", "0148_add_custom_field_related_model_constraint"),
+        ("dcim", "0097_virtualdevicecontext_controller_managed_device_group"),
+        ("extras", "0145_objectmetadata_assigned_object_type_cascade"),
     ]
 
     operations = [

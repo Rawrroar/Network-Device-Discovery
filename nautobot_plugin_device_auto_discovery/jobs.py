@@ -22,7 +22,8 @@ from nautobot.apps.jobs import (
     StringVar,
     TextVar,
 )
-from nautobot.dcim.models import Device, DeviceType, Location, LocationType, Manufacturer, Platform, Role
+from nautobot.dcim.models import Device, DeviceType, Location, LocationType, Manufacturer, Platform
+from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
 
 from .models import DiscoveryScan, DiscoveryResult

@@ -4,7 +4,8 @@ from unittest.mock import patch, MagicMock
 
 from django.test import TestCase, TransactionTestCase
 from nautobot.extras.test_tools import run_job_for_testing
-from nautobot.dcim.models import Device, DeviceType, Location, LocationType, Manufacturer, Platform, Role
+from nautobot.dcim.models import Device, DeviceType, Location, LocationType, Manufacturer, Platform
+from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
 
 from nautobot_plugin_device_auto_discovery.mappings import lookup_platform_from_oid

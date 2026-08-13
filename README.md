@@ -37,7 +37,7 @@ Raw walked tables are stored in `DiscoveryResult.discovered_data` so you can rev
 
 - Nautobot >= 3.0, < 4.0
 - Python >= 3.9
-- `pysnmp>=4.4` for SNMP queries
+- `pysnmp>=4.4` for SNMP queries (both the classic sync API, pysnmp < 7, and the asyncio API, pysnmp >= 7, are supported)
 - `paramiko` for SSH connections
 
 ## Installation

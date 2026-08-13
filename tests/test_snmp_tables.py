@@ -300,10 +300,14 @@ class DiscoverTablesTests(TestCase):
             side_effect=lambda ip_str, oid, *a, **k: columns.get(oid, {}),
         ):
             with patch(
-                "nautobot_plugin_device_auto_discovery.snmp_tables.collect_neighbors",
-                side_effect=RuntimeError("LLDP agent unreachable"),
+                "nautobot_plugin_device_auto_discovery.snmp_tables.snmp_get",
+                return_value=None,
             ):
-                tables = discover_snmp_tables("192.0.2.1", CONFIG)
+                with patch(
+                    "nautobot_plugin_device_auto_discovery.snmp_tables.collect_neighbors",
+                    side_effect=RuntimeError("LLDP agent unreachable"),
+                ):
+                    tables = discover_snmp_tables("192.0.2.1", CONFIG)
 
         self.assertEqual(len(tables["interfaces"]), 1)
         self.assertEqual(tables["neighbors"], [])
@@ -312,12 +316,16 @@ class DiscoverTablesTests(TestCase):
 
     def test_neighbors_skipped_when_disabled(self):
         with patch(
-            "nautobot_plugin_device_auto_discovery.snmp_tables.collect_neighbors",
-            return_value=[{"remote_name": "nope"}],
-        ) as mocked:
-            config = dict(CONFIG)
-            config["include_neighbors"] = False
-            tables = discover_snmp_tables("192.0.2.1", config)
+            "nautobot_plugin_device_auto_discovery.snmp_tables.snmp_get",
+            return_value=None,
+        ):
+            with patch(
+                "nautobot_plugin_device_auto_discovery.snmp_tables.collect_neighbors",
+                return_value=[{"remote_name": "nope"}],
+            ) as mocked:
+                config = dict(CONFIG)
+                config["include_neighbors"] = False
+                tables = discover_snmp_tables("192.0.2.1", config)
 
         self.assertEqual(tables["neighbors"], [])
         mocked.assert_not_called()

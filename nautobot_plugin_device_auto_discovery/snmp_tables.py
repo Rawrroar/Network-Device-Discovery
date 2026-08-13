@@ -15,7 +15,9 @@ populate Nautobot objects. A failure in any single table never
 aborts discovery of the device.
 """
 
+import asyncio
 import logging
+import threading
 
 from netaddr import IPAddress
 
@@ -91,24 +93,130 @@ OPER_STATUS_UP = 1
 #  Low-level SNMP helpers                                             #
 # ------------------------------------------------------------------ #
 
+_snmp_api_cache = {"resolved": False, "value": None}
 
-def _snmp_engine_imports():
-    """Import the synchronous pysnmp hlapi symbols used for GET/WALK."""
-    from pysnmp.hlapi import (
-        SnmpEngine,
-        CommunityData,
-        UdpTransportTarget,
-        ContextData,
-        ObjectType,
-        ObjectIdentity,
-    )
 
-    return SnmpEngine, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity
+def _load_snmp_api():
+    """Detect the installed pysnmp API.
+
+    Returns a dict of callables for either the classic synchronous API
+    (pysnmp < 7) or the asyncio API (pysnmp >= 7), or None if pysnmp
+    is not importable at all.
+    """
+    try:
+        from pysnmp.hlapi import (  # noqa: PLC0415 - classic sync API, pysnmp < 7
+            SnmpEngine,
+            CommunityData,
+            UdpTransportTarget,
+            ContextData,
+            ObjectType,
+            ObjectIdentity,
+            getCmd,
+            nextCmd,
+        )
+
+        return {
+            "kind": "classic",
+            "SnmpEngine": SnmpEngine,
+            "CommunityData": CommunityData,
+            "UdpTransportTarget": UdpTransportTarget,
+            "ContextData": ContextData,
+            "ObjectType": ObjectType,
+            "ObjectIdentity": ObjectIdentity,
+            "getCmd": getCmd,
+            "nextCmd": nextCmd,
+        }
+    except ImportError:
+        pass
+
+    try:
+        from pysnmp.hlapi.asyncio import (  # noqa: PLC0415 - asyncio API, pysnmp >= 7
+            SnmpEngine,
+            CommunityData,
+            UdpTransportTarget,
+            ContextData,
+            ObjectType,
+            ObjectIdentity,
+            get_cmd,
+            walk_cmd,
+        )
+
+        return {
+            "kind": "async",
+            "SnmpEngine": SnmpEngine,
+            "CommunityData": CommunityData,
+            "UdpTransportTarget": UdpTransportTarget,
+            "ContextData": ContextData,
+            "ObjectType": ObjectType,
+            "ObjectIdentity": ObjectIdentity,
+            "get_cmd": get_cmd,
+            "walk_cmd": walk_cmd,
+        }
+    except ImportError:
+        return None
+
+
+def _get_snmp_api():
+    if not _snmp_api_cache["resolved"]:
+        _snmp_api_cache["value"] = _load_snmp_api()
+        _snmp_api_cache["resolved"] = True
+    return _snmp_api_cache["value"]
 
 
 def _community_kwargs(community):
     """Build kwargs for CommunityData (SNMPv2c)."""
     return {"mpModel": 0}
+
+
+def _run_async(coro):
+    """Run a coroutine synchronously, tolerating an already-running loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result = {}
+
+    def _runner():
+        result["value"] = asyncio.run(coro)
+
+    thread = threading.Thread(target=_runner)
+    thread.start()
+    thread.join()
+    return result["value"]
+
+
+def _classic_get(api, ip_str, oid, community, timeout, retries):
+    error_indication, error_status, error_index, var_binds = next(
+        api["getCmd"](
+            api["SnmpEngine"](),
+            api["CommunityData"](community, **_community_kwargs(community)),
+            api["UdpTransportTarget"]((ip_str, 161), timeout=timeout, retries=retries),
+            api["ContextData"](),
+            api["ObjectType"](api["ObjectIdentity"](oid)),
+        )
+    )
+    if not error_indication and not error_status and var_binds:
+        return str(var_binds[0][1])
+    return None
+
+
+async def _async_get_impl(api, ip_str, oid, community, timeout, retries):
+    transport = await api["UdpTransportTarget"].create((ip_str, 161), timeout=timeout, retries=retries)
+    error_indication, error_status, error_index, var_binds = await api["get_cmd"](
+        api["SnmpEngine"](),
+        api["CommunityData"](community, **_community_kwargs(community)),
+        transport,
+        api["ContextData"](),
+        api["ObjectType"](api["ObjectIdentity"](oid)),
+    )
+    if not error_indication and not error_status and var_binds:
+        return str(var_binds[0][1])
+    return None
+
+
+def _async_get(api, ip_str, oid, community, timeout, retries):
+    return _run_async(_async_get_impl(api, ip_str, oid, community, timeout, retries))
 
 
 def snmp_get(ip_str, oid, community="public", timeout=3, retries=2):
@@ -117,29 +225,69 @@ def snmp_get(ip_str, oid, community="public", timeout=3, retries=2):
     Returns:
         str value or None on failure.
     """
-    try:
-        from pysnmp.hlapi import getCmd
-
-        SnmpEngine, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity = _snmp_engine_imports()
-
-        error_indication, error_status, error_index, var_binds = next(
-            getCmd(
-                SnmpEngine(),
-                CommunityData(community, **_community_kwargs(community)),
-                UdpTransportTarget((ip_str, 161), timeout=timeout, retries=retries),
-                ContextData(),
-                ObjectType(ObjectIdentity(oid)),
-            )
-        )
-        if not error_indication and not error_status and var_binds:
-            return str(var_binds[0][1])
-    except ImportError:
-        logger.warning("pysnmp not installed; SNMP discovery will not work.")
+    api = _get_snmp_api()
+    if not api:
+        logger.warning("pysnmp not installed or unsupported; SNMP discovery will not work.")
         return None
+
+    try:
+        if api["kind"] == "classic":
+            return _classic_get(api, ip_str, oid, community, timeout, retries)
+        return _async_get(api, ip_str, oid, community, timeout, retries)
     except Exception as exc:
         logger.debug("SNMP GET failed for %s OID %s: %s", ip_str, oid, exc)
         return None
-    return None
+
+
+def _classic_walk(api, ip_str, oid, community, timeout, retries, max_rows):
+    rows = []
+    prefix = oid.rstrip(".") + "."
+    for error_indication, error_status, error_index, var_binds in api["nextCmd"](
+        api["SnmpEngine"](),
+        api["CommunityData"](community, **_community_kwargs(community)),
+        api["UdpTransportTarget"]((ip_str, 161), timeout=timeout, retries=retries),
+        api["ContextData"](),
+        api["ObjectType"](api["ObjectIdentity"](oid)),
+        lexicographicMode=False,
+        maxRows=max_rows,
+    ):
+        if error_indication or error_status:
+            logger.debug("SNMP WALK error for %s OID %s: %s", ip_str, oid, error_indication or error_status)
+            break
+        for var_bind in var_binds:
+            full_oid = str(var_bind[0])
+            if not full_oid.startswith(prefix):
+                return rows
+            rows.append((full_oid, str(var_bind[1])))
+    return rows
+
+
+async def _async_walk_impl(api, ip_str, oid, community, timeout, retries, max_rows):
+    transport = await api["UdpTransportTarget"].create((ip_str, 161), timeout=timeout, retries=retries)
+    rows = []
+    prefix = oid.rstrip(".") + "."
+    async for error_indication, error_status, error_index, var_binds in api["walk_cmd"](
+        api["SnmpEngine"](),
+        api["CommunityData"](community, **_community_kwargs(community)),
+        transport,
+        api["ContextData"](),
+        api["ObjectType"](api["ObjectIdentity"](oid)),
+        lexicographicMode=False,
+        maxRows=max_rows,
+    ):
+        if error_indication or error_status:
+            logger.debug("SNMP WALK error for %s OID %s: %s", ip_str, oid, error_indication or error_status)
+            break
+        for var_bind in var_binds:
+            full_oid = str(var_bind[0])
+            if not full_oid.startswith(prefix):
+                return rows
+            rows.append((full_oid, str(var_bind[1])))
+    return rows
+
+
+def _async_walk(api, ip_str, oid, community, timeout, retries, max_rows):
+    return _run_async(_async_walk_impl(api, ip_str, oid, community, timeout, retries, max_rows))
 
 
 def snmp_walk(ip_str, oid, community="public", timeout=3, retries=2, max_rows=1000):
@@ -149,38 +297,18 @@ def snmp_walk(ip_str, oid, community="public", timeout=3, retries=2, max_rows=10
         list of (full_oid, value) tuples, or [] on any failure.
         The list is capped at ``max_rows`` rows.
     """
-    rows = []
-    try:
-        from pysnmp.hlapi import nextCmd
-
-        SnmpEngine, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity = _snmp_engine_imports()
-        oid = str(oid).rstrip(".")
-        prefix = oid + "."
-
-        for error_indication, error_status, error_index, var_binds in nextCmd(
-            SnmpEngine(),
-            CommunityData(community, **_community_kwargs(community)),
-            UdpTransportTarget((ip_str, 161), timeout=timeout, retries=retries),
-            ContextData(),
-            ObjectType(ObjectIdentity(oid)),
-            lexicographicMode=False,
-            maxRows=max_rows,
-        ):
-            if error_indication or error_status:
-                logger.debug("SNMP WALK error for %s OID %s: %s", ip_str, oid, error_indication or error_status)
-                break
-            for var_bind in var_binds:
-                full_oid = str(var_bind[0])
-                if not full_oid.startswith(prefix):
-                    return rows
-                rows.append((full_oid, str(var_bind[1])))
-    except ImportError:
-        logger.warning("pysnmp not installed; SNMP discovery will not work.")
+    api = _get_snmp_api()
+    if not api:
+        logger.warning("pysnmp not installed or unsupported; SNMP discovery will not work.")
         return []
+
+    try:
+        if api["kind"] == "classic":
+            return _classic_walk(api, ip_str, oid, community, timeout, retries, max_rows)
+        return _async_walk(api, ip_str, oid, community, timeout, retries, max_rows)
     except Exception as exc:
         logger.debug("SNMP WALK failed for %s OID %s: %s", ip_str, oid, exc)
         return []
-    return rows
 
 
 def walk_columns(ip_str, oid, community, timeout, retries, max_rows):

@@ -418,6 +418,11 @@ def snmp_discover_device(ip_str, config):
     sys_object_id = system.get("sys_object_id", "")
 
     if not sys_name and not sys_descr:
+        logger.debug(
+            "No SNMP system info from %s (community %r); host may not be SNMP-reachable",
+            ip_str,
+            config.get("snmp_community", "public"),
+        )
         return None
 
     platform_info = lookup_platform_from_oid(sys_object_id)

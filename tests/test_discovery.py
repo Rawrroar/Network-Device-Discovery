@@ -1,5 +1,6 @@
 """Tests for the Device Auto-Discovery plugin."""
 
+import socket
 from unittest.mock import patch, MagicMock
 
 from django.test import TestCase, TransactionTestCase
@@ -21,6 +22,9 @@ from nautobot_plugin_device_auto_discovery.jobs import (
     get_or_create_manufacturer,
     get_or_create_platform,
     get_or_create_device_type,
+    ssh_connect_and_discover,
+    tcp_port_open,
+    _parse_ssh_output,
 )
 
 
@@ -499,7 +503,11 @@ class SSHDiscoveryJobTests(TestCase):
         self.assertIn("error", result)
 
     def test_ssh_discovery_with_mock(self):
-        def mock_ssh_discover(ip_str, username, password, timeout, banner_timeout):
+        captured = {}
+
+        def mock_ssh_discover(ip_str, username, password, timeout, banner_timeout, port=22, enable_password=None, port_check=True):
+            captured["port"] = port
+            captured["username"] = username
             if ip_str == "10.0.0.1":
                 return {
                     "hostname": "router-001",
@@ -508,6 +516,7 @@ class SSHDiscoveryJobTests(TestCase):
                     "serial": "JS212345678",
                     "os_version": "21.2R3",
                     "raw_output": "",
+                    "command_outputs": {"show version": "Model: MX204"},
                 }
             return None
 
@@ -521,12 +530,302 @@ class SSHDiscoveryJobTests(TestCase):
                     "target_network": "10.0.0.0/30",
                     "ssh_username": "admin",
                     "ssh_password": "password123",
+                    "ssh_port": 22,
                     "timeout": 1,
                     "concurrency": 5,
+                    "dryrun": False,
                 },
             )
             self.assertIn("discovered", result)
             self.assertIn("created", result)
+            self.assertEqual(captured["port"], 22)
+            self.assertEqual(captured["username"], "admin")
+
+        discovery_result = DiscoveryResult.objects.get(ip_address="10.0.0.1")
+        self.assertEqual(discovery_result.discovery_method, "ssh")
+        self.assertIn("command_outputs", discovery_result.discovered_data)
+        self.assertEqual(discovery_result.discovered_data["command_outputs"]["show version"], "Model: MX204")
+
+    def test_ssh_discovery_dry_run_creates_nothing(self):
+        def mock_ssh_discover(ip_str, username, password, timeout, banner_timeout, port=22, enable_password=None, port_check=True):
+            if ip_str == "10.0.0.1":
+                return {
+                    "hostname": "router-002",
+                    "vendor": "Cisco",
+                    "model": "C9300",
+                    "serial": "FOC11111111",
+                    "os_version": "17.3",
+                    "raw_output": "",
+                    "command_outputs": {},
+                }
+            return None
+
+        with patch(
+            "nautobot_plugin_device_auto_discovery.jobs.ssh_connect_and_discover",
+            side_effect=mock_ssh_discover,
+        ):
+            result = run_job_for_testing(
+                SSHDiscoveryJob,
+                data={
+                    "target_network": "10.0.0.0/30",
+                    "ssh_username": "admin",
+                    "ssh_password": "password123",
+                    "ssh_port": 22,
+                    "timeout": 1,
+                    "concurrency": 5,
+                    "dryrun": True,
+                },
+            )
+            self.assertEqual(result["discovered"], 1)
+            self.assertEqual(result["created"], 0)
+
+        self.assertFalse(Device.objects.filter(name="router-002").exists())
+
+        discovery_result = DiscoveryResult.objects.get(ip_address="10.0.0.1")
+        self.assertIsNone(discovery_result.nautobot_device)
+        self.assertIn("Dry-run", discovery_result.error_message)
+
+    def test_ssh_discovery_uses_config_defaults(self):
+        captured = {}
+
+        def mock_ssh_discover(ip_str, username, password, timeout, banner_timeout, port=22, enable_password=None, port_check=True):
+            captured.update(username=username, password=password, port=port)
+            if ip_str == "10.0.0.1":
+                return {
+                    "hostname": "router-003",
+                    "vendor": "Cisco",
+                    "model": "C9300",
+                    "serial": "",
+                    "os_version": "",
+                    "command_outputs": {},
+                }
+            return None
+
+        with patch(
+            "nautobot_plugin_device_auto_discovery.jobs.get_plugin_config",
+            return_value={
+                "ssh_username": "ops",
+                "ssh_password": "secret",
+                "ssh_port": 2222,
+                "ssh_banner_timeout": 5,
+            },
+        ):
+            with patch(
+                "nautobot_plugin_device_auto_discovery.jobs.ssh_connect_and_discover",
+                side_effect=mock_ssh_discover,
+            ):
+                result = run_job_for_testing(
+                    SSHDiscoveryJob,
+                    data={
+                        "target_network": "10.0.0.0/30",
+                        "ssh_username": "",
+                        "ssh_password": "",
+                        "ssh_port": 22,
+                        "timeout": 1,
+                        "concurrency": 5,
+                        "dryrun": False,
+                    },
+                )
+                self.assertEqual(result["created"], 1)
+
+        self.assertEqual(captured["username"], "ops")
+        self.assertEqual(captured["password"], "secret")
+        self.assertEqual(captured["port"], 22)
+
+
+class SSHFakeChannel:
+    """Minimal fake of a paramiko channel backed by scripted byte responses."""
+
+    def __init__(self, initial=b"", responses=()):
+        self.buffer = initial
+        self.responses = list(responses)
+        self.sent = []
+        self.timeout = None
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def send(self, data):
+        self.sent.append(data.decode("utf-8").strip())
+        if self.responses:
+            self.buffer += self.responses.pop(0)
+        return len(data)
+
+    def recv(self, n):
+        if self.buffer:
+            data, self.buffer = self.buffer[:n], self.buffer[n:]
+            return data
+        raise socket.timeout()
+
+
+class SSHFakeClient:
+    """Minimal fake of a paramiko SSHClient."""
+
+    def __init__(self, channel):
+        self.channel = channel
+        self.connect_kwargs = {}
+        self.closed = False
+
+    def set_missing_host_key_policy(self, policy):
+        pass
+
+    def connect(self, **kwargs):
+        self.connect_kwargs = kwargs
+
+    def invoke_shell(self):
+        return self.channel
+
+    def close(self):
+        self.closed = True
+
+
+class SSHConnectionTests(TestCase):
+    """Unit tests for the SSH connection/discovery helper."""
+
+    CISCO_BANNER = "Cisco IOS switch\nswitch-001>\n"
+    CISCO_SHOW_VERSION = (
+        "Cisco IOS Software, C2960 Software (C2960-LANBASEK9-M), Version 15.2(2)E7, RELEASE SOFTWARE (fc1)\n"
+        "cisco WS-C2960-24TT-L (PowerPC405) processor (revision C0) with 65536K/4088K bytes of memory.\n"
+        "Processor board ID FOC1234A5B6\n"
+        "switch-001#\n"
+    )
+    CISCO_SHOW_INVENTORY = (
+        'NAME: "Chassis", DESCR: "Cisco WS-C2960-24TT-L"\n'
+        "PID: WS-C2960-24TT-L , VID: V02, SN: FOC1234A5B6\n"
+        "switch-001#\n"
+    )
+    JUNIPER_BANNER = "Juniper Networks\n--- JUNOS 21.2R3.15 Kernel 64-bit ---\n{master:0}\nroot@mx204>\n"
+    JUNIPER_SHOW_VERSION = (
+        "Hostname: mx204-01\n"
+        "Model: mx204\n"
+        "Junos: 21.2R3.15\n"
+        "JUNOS Base OS boot [21.2R3.15]\n"
+        "{master:0}\n"
+    )
+    JUNIPER_SHOW_CHASSIS = (
+        "Hardware inventory:\n"
+        "Item             Version  Part number  Serial number     Description\n"
+        "Chassis                                JN1234567890      MX204\n"
+    )
+
+    def _run_fake(self, banner, responses):
+        """Run ssh_connect_and_discover against a fake client and return the result."""
+        channel = SSHFakeChannel(initial=banner, responses=responses)
+        client = SSHFakeClient(channel)
+        fake_paramiko = MagicMock()
+        fake_paramiko.SSHClient.return_value = client
+        fake_paramiko.AutoAddPolicy = MagicMock()
+        with patch.dict("sys.modules", {"paramiko": fake_paramiko}):
+            return ssh_connect_and_discover(
+                "10.0.0.1",
+                "admin",
+                "password",
+                timeout=5,
+                port=22,
+                enable_password="enablepw",
+                port_check=False,
+            )
+
+    def test_parser_cisco(self):
+        combined = "\n".join([self.CISCO_BANNER, self.CISCO_SHOW_VERSION, self.CISCO_SHOW_INVENTORY])
+        hostname, model, serial, os_version = _parse_ssh_output(combined, "Cisco")
+        self.assertEqual(hostname, "switch-001")
+        self.assertEqual(model, "WS-C2960-24TT-L")
+        self.assertEqual(serial, "FOC1234A5B6")
+        self.assertEqual(os_version, "15.2(2)E7")
+
+    def test_parser_juniper(self):
+        combined = "\n".join([self.JUNIPER_BANNER, self.JUNIPER_SHOW_VERSION, self.JUNIPER_SHOW_CHASSIS])
+        hostname, model, serial, os_version = _parse_ssh_output(combined, "Juniper Networks")
+        self.assertEqual(hostname, "mx204-01")
+        self.assertEqual(model, "mx204")
+        self.assertEqual(serial, "JN1234567890")
+        self.assertEqual(os_version, "21.2R3.15")
+
+    def test_parser_generic_fallback(self):
+        combined = (
+            "ABC-Networking Systems, Version 3.2.1\n"
+            "hostname: box-9\n"
+            "serial number: SN-GENERIC\n"
+            "model: ModelX\n"
+        )
+        hostname, model, serial, os_version = _parse_ssh_output(combined, "")
+        self.assertEqual(hostname, "box-9")
+        self.assertEqual(model, "ModelX")
+        self.assertEqual(serial, "SN-GENERIC")
+        self.assertEqual(os_version, "3.2.1")
+
+    def test_connect_cisco_full_flow(self):
+        responses = [
+            b"Password:\n",       # after "enable"
+            b"switch-001#\n",     # after enable password
+            b"switch-001#\n",     # after "terminal length 0"
+            self.CISCO_SHOW_VERSION.encode(),
+            self.CISCO_SHOW_INVENTORY.encode(),
+        ]
+        result = self._run_fake(self.CISCO_BANNER, responses)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["hostname"], "switch-001")
+        self.assertEqual(result["model"], "WS-C2960-24TT-L")
+        self.assertEqual(result["serial"], "FOC1234A5B6")
+        self.assertEqual(result["os_version"], "15.2(2)E7")
+        self.assertEqual(result["vendor"], "Cisco")
+        self.assertIn("show version", result["command_outputs"])
+        self.assertIn("__banner__", result["command_outputs"])
+
+    def test_connect_juniper_full_flow(self):
+        responses = [
+            b"{master:0}\n",                              # after "set cli screen-length 0"
+            b"{master:0}\n",                              # after "set cli screen-width 0"
+            self.JUNIPER_SHOW_VERSION.encode(),
+            self.JUNIPER_SHOW_CHASSIS.encode(),
+        ]
+        result = self._run_fake(self.JUNIPER_BANNER, responses)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["hostname"], "mx204-01")
+        self.assertEqual(result["model"], "mx204")
+        self.assertEqual(result["serial"], "JN1234567890")
+        self.assertEqual(result["os_version"], "21.2R3.15")
+        self.assertEqual(result["vendor"], "Juniper Networks")
+
+    def test_connect_unknown_vendor_uses_generic_commands(self):
+        banner = "generic-box>\n"
+        responses = [
+            self.CISCO_SHOW_VERSION.encode(),   # generic loop "show version" detects Cisco
+            b"Password:\n",                     # after "enable"
+            b"generic-box#\n",                  # after enable password
+            b"generic-box#\n",                  # after "terminal length 0"
+            self.CISCO_SHOW_INVENTORY.encode(), # "show inventory"
+        ]
+        result = self._run_fake(banner, responses)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["vendor"], "Cisco")
+        self.assertEqual(result["model"], "WS-C2960-24TT-L")
+        self.assertEqual(result["hostname"], "generic-box")
+
+    def test_connect_port_check_skips_closed_port(self):
+        with patch("nautobot_plugin_device_auto_discovery.jobs.tcp_port_open", return_value=False):
+            result = ssh_connect_and_discover("10.0.0.1", "admin", "password", timeout=5, port=22)
+        self.assertIsNone(result)
+
+    def test_connect_cleans_up_on_error(self):
+        channel = SSHFakeChannel(initial=b"switch-001>\n", responses=[])
+        client = SSHFakeClient(channel)
+
+        def boom(**kwargs):
+            raise socket.timeout()
+
+        client.connect = boom
+        fake_paramiko = MagicMock()
+        fake_paramiko.SSHClient.return_value = client
+        fake_paramiko.AutoAddPolicy = MagicMock()
+        with patch.dict("sys.modules", {"paramiko": fake_paramiko}):
+            result = ssh_connect_and_discover("10.0.0.1", "admin", "password", timeout=5, port=22, port_check=False)
+        self.assertIsNone(result)
+        self.assertTrue(client.closed)
+
+    def test_tcp_port_open(self):
+        self.assertFalse(tcp_port_open("192.0.2.1", 22, timeout=1))
 
 
 class FullDiscoveryJobTests(TestCase):

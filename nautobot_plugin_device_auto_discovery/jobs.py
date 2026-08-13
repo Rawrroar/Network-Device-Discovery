@@ -8,6 +8,7 @@ import logging
 import re
 import socket
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from django.conf import settings
@@ -40,6 +41,7 @@ from nautobot.ipam.models import IPAddress
 from .models import DiscoveryScan, DiscoveryResult
 from .mappings import lookup_platform_from_oid
 from .snmp_tables import discover_snmp_tables, find_chassis_serial, snmp_get
+from .ssh_profiles import SSH_PROFILES, GENERIC_INFO_COMMANDS
 
 # Common SNMP constants kept for backward compatibility
 from .snmp_tables import (
@@ -864,21 +866,157 @@ class SNMPDiscoveryJob(Job):
 # ------------------------------------------------------------------ #
 
 
-def ssh_connect_and_discover(ip_str, username, password, timeout=10, banner_timeout=30):
-    """Connect to a device via SSH and extract identification info.
+def tcp_port_open(ip_str, port, timeout=3):
+    """Return True if a TCP connection to (ip, port) succeeds within timeout."""
+    try:
+        sock = socket.create_connection((ip_str, port), timeout=timeout)
+        sock.close()
+        return True
+    except (socket.error, OSError):
+        return False
+
+
+def _extract_prompt(text):
+    """Extract the device CLI prompt from command output, if visible.
+
+    Prompts are the last non-empty line ending in ``>``, ``#``, or ``$``.
+    Terminal escape sequences (e.g. colored banners) are stripped first.
+    """
+    last = ""
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            last = line.strip()
+            break
+    last = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", last)
+    if re.search(r"[>#$]\s*$", last):
+        return last
+    return ""
+
+
+def _read_until_prompt(shell, timeout=10, max_output=2_000_000):
+    """Read from an interactive paramiko shell until the prompt appears.
+
+    Returns raw bytes. Never blocks longer than ``timeout`` even if the
+    device never emits a prompt or keeps the channel open.
+    """
+    buffer = b""
+    shell.settimeout(timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline and len(buffer) < max_output:
+        try:
+            data = shell.recv(65536)
+        except socket.timeout:
+            break
+        except Exception:
+            break
+        if not data:
+            break
+        buffer += data
+        if _extract_prompt(buffer.decode("utf-8", errors="replace")):
+            break
+    return buffer
+
+
+def _send_and_read(shell, command, timeout=10, max_output=2_000_000):
+    """Send a command to an interactive shell and read until the prompt returns."""
+    shell.send(command.encode("utf-8") + b"\n")
+    return _read_until_prompt(shell, timeout=timeout, max_output=max_output)
+
+
+def _parse_ssh_output(combined, vendor):
+    """Apply vendor-specific (or generic) regex parsers to SSH output.
 
     Returns:
-        dict with hostname, vendor, model, serial, os_version
+        tuple (hostname, model, serial, os_version)
+    """
+    hostname = ""
+    model = ""
+    serial = ""
+    os_version = ""
+
+    profile = SSH_PROFILES.get(vendor, {})
+    parsers = profile.get("parsers", {})
+    if not parsers:
+        # Generic fallback
+        lines = combined.strip().split("\n")
+        first_lines = "\n".join(lines[:10])
+        hostname_match = re.search(r"(?:hostname|host)\s*[:\s]+(\S+)", first_lines, re.IGNORECASE)
+        if hostname_match:
+            hostname = hostname_match.group(1)
+        serial_match = re.search(r"(?:serial\s*number|serial\s*id|SN)\s*[:\s]+(\S+)", combined, re.IGNORECASE)
+        if serial_match:
+            serial = serial_match.group(1)
+        ver_match = re.search(r"(?:version|software|os)\s+([\w\d\.]+)", combined, re.IGNORECASE)
+        if ver_match:
+            os_version = ver_match.group(1)
+        model_match = re.search(r"(?:model|platform|hardware)\s*[:\s]+(.+?)(?:,|$|\s)", combined, re.IGNORECASE)
+        if model_match:
+            model = model_match.group(1).strip()
+        return hostname, model, serial, os_version
+
+    for field, patterns in parsers.items():
+        for regex in patterns:
+            match = re.search(regex, combined, re.IGNORECASE | re.MULTILINE)
+            if match:
+                value = match.group(1) if match.groups() else match.group(0).strip()
+                if field == "hostname":
+                    hostname = value
+                elif field == "model":
+                    model = value
+                elif field == "serial":
+                    serial = value
+                elif field == "os_version":
+                    os_version = value
+                break
+
+    return hostname, model, serial, os_version
+
+
+def ssh_connect_and_discover(
+    ip_str,
+    username,
+    password,
+    timeout=10,
+    banner_timeout=30,
+    port=22,
+    enable_password=None,
+    port_check=True,
+):
+    """Connect to a device via SSH and extract identification info.
+
+    Performs a quick TCP port check first (unless ``port_check`` is False),
+    opens a PTY-backed shell, disables paging, escalates to privileged exec
+    when needed, runs vendor-specific show commands, and parses the output.
+
+    Returns:
+        dict with hostname, vendor, model, serial, os_version, port,
+        command_outputs, raw_output
         or None on failure.
     """
     try:
         import paramiko
+    except ImportError:
+        logger.warning("paramiko not installed; SSH discovery will not work.")
+        return None
 
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    if port_check and not tcp_port_open(ip_str, port, timeout=min(timeout, 5)):
+        logger.debug("Port %d not open on %s", port, ip_str)
+        return None
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    command_outputs = {}
+    hostname = ""
+    vendor = ""
+    model = ""
+    serial = ""
+    os_version = ""
+
+    try:
         client.connect(
             hostname=ip_str,
-            port=22,
+            port=port,
             username=username,
             password=password,
             timeout=timeout,
@@ -887,68 +1025,67 @@ def ssh_connect_and_discover(ip_str, username, password, timeout=10, banner_time
             allow_agent=False,
         )
 
-        hostname = ""
-        vendor = ""
-        model = ""
-        serial = ""
-        os_version = ""
+        # Open a persistent interactive shell. Network devices require a
+        # pseudo-terminal and typically present their CLI as the user shell,
+        # so state (paging, enable mode) is preserved between commands.
+        shell = client.invoke_shell()
+        shell.settimeout(timeout)
 
-        # Run show version / equivalent commands
-        version_commands = [
-            "show version",
-            "display version",
-            "show system information",
-            "display current-version",
-        ]
+        banner = _read_until_prompt(shell, timeout=timeout).decode("utf-8", errors="replace")
+        command_outputs["__banner__"] = banner
+        prompt = _extract_prompt(banner)
 
-        output = ""
-        for cmd in version_commands:
-            try:
-                stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-                output = stdout.read().decode("utf-8", errors="replace")
-                err = stderr.read().decode("utf-8", errors="replace")
-                if output and "invalid" not in output.lower() and "error" not in err.lower():
-                    break
-                output = ""
-            except (paramiko.SSHException, socket.timeout):
-                continue
+        # Detect the vendor from the login banner first.
+        vendor = detect_vendor_from_descr(banner)
+        profile = SSH_PROFILES.get(vendor)
 
-        if output:
-            import re
-
-            lines = output.strip().split("\n")
-            first_lines = "\n".join(lines[:10])
-
-            # Try to extract hostname from banner or command output
-            hostname_match = re.search(r"(?:hostname|host)\s*[:\s]+(\S+)", first_lines, re.IGNORECASE)
-            if hostname_match:
-                hostname = hostname_match.group(1)
-            else:
-                hostname = ip_str
-
-            # Try to extract serial
-            serial_match = re.search(r"(?:serial\s*number|serial\s*id|SN)\s*[:\s]+(\S+)", output, re.IGNORECASE)
-            if serial_match:
-                serial = serial_match.group(1)
-
-            # Try to extract version
-            ver_match = re.search(r"(?:version|software|os)\s+([\w\d\.]+)", output, re.IGNORECASE)
-            if ver_match:
-                os_version = ver_match.group(1)
-
-            # Try to extract model
-            model_match = re.search(r"(?:model|platform|hardware)\s*[:\s]+(.+?)(?:,|$|\s)", output, re.IGNORECASE)
-            if model_match:
-                model = model_match.group(1).strip()
-
-            # Detect vendor from output
-            for pattern, vendor_name in VENDOR_KEYWORDS.items():
-                if re.search(pattern, output, re.IGNORECASE):
-                    vendor = vendor_name
-                    break
-
+        if not vendor:
+            # No vendor hint in the banner; try generic identification
+            # commands and detect from the first usable response.
+            for cmd in GENERIC_INFO_COMMANDS:
+                out = _send_and_read(shell, cmd, timeout=timeout).decode("utf-8", errors="replace")
+                command_outputs[cmd] = out
+                if out and "invalid" not in out.lower():
+                    vendor = detect_vendor_from_descr(out)
+                    profile = SSH_PROFILES.get(vendor)
+                    if vendor:
+                        break
             if not vendor:
-                vendor = lines[0].split()[0] if lines else "Unknown"
+                first = banner.strip().split()
+                vendor = first[0] if first else "Unknown"
+
+        if profile is None:
+            profile = SSH_PROFILES.get(vendor) or {}
+
+        # Best-effort escalation to privileged exec when the login prompt is
+        # a user-level ">" prompt and an enable password is available.
+        if profile.get("requires_enable") and prompt and prompt.endswith(">"):
+            enable_out = _send_and_read(shell, "enable", timeout=timeout).decode("utf-8", errors="replace")
+            if "password" in enable_out.lower() and enable_password:
+                time.sleep(0.3)
+                enable_out += _send_and_read(shell, enable_password, timeout=timeout).decode(
+                    "utf-8", errors="replace"
+                )
+            command_outputs["__enable__"] = enable_out
+            prompt = _extract_prompt(enable_out)
+
+        # Disable paging so long outputs are not truncated (errors ignored).
+        for cmd in profile.get("pre_commands", []):
+            _send_and_read(shell, cmd, timeout=timeout)
+
+        # Run the vendor-specific identification commands.
+        info_commands = profile.get("commands") or list(GENERIC_INFO_COMMANDS)
+        for cmd in info_commands:
+            if cmd in command_outputs:
+                continue
+            out = _send_and_read(shell, cmd, timeout=timeout).decode("utf-8", errors="replace")
+            command_outputs[cmd] = out
+
+        combined = "\n".join(command_outputs.values())
+        hostname, model, serial, os_version = _parse_ssh_output(combined, vendor)
+
+        if not hostname:
+            hostname = ip_str
 
         client.close()
 
@@ -958,15 +1095,19 @@ def ssh_connect_and_discover(ip_str, username, password, timeout=10, banner_time
             "model": model,
             "serial": serial,
             "os_version": os_version,
-            "raw_output": output[:500],
+            "port": port,
+            "command_outputs": command_outputs,
+            "raw_output": combined[:500],
         }
 
-    except ImportError:
-        logger.warning("paramiko not installed; SSH discovery will not work.")
-        return None
     except Exception as exc:
         logger.debug("SSH discovery failed for %s: %s", ip_str, exc)
         return None
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 class SSHDiscoveryJob(Job):
@@ -983,8 +1124,8 @@ class SSHDiscoveryJob(Job):
         Discover network devices using SSH across an IP range.
 
         For each reachable host:
-        1. Connects via SSH on port 22
-        2. Runs vendor-agnostic show commands
+        1. Connects via SSH (default port 22)
+        2. Runs vendor-specific show commands to gather identification info
         3. Parses output for hostname, model, serial, and OS version
         4. Auto-creates Nautobot Device objects
 
@@ -998,13 +1139,19 @@ class SSHDiscoveryJob(Job):
         description="CIDR network to scan (e.g., 10.0.0.0/24)"
     )
     ssh_username = StringVar(
-        default="admin",
-        description="SSH username for device login.",
+        default="",
+        description="SSH username for device login (falls back to plugin config).",
     )
     ssh_password = StringVar(
         default="",
         description="SSH password for device login. "
                     "Recommended: use Nautobot Secrets and paste the value here.",
+    )
+    ssh_port = IntegerVar(
+        default=22,
+        min_value=1,
+        max_value=65535,
+        description="SSH port to connect to.",
     )
     timeout = IntegerVar(
         default=10,
@@ -1018,9 +1165,14 @@ class SSHDiscoveryJob(Job):
         max_value=50,
         description="Number of concurrent SSH probes.",
     )
+    dryrun = DryRunVar()
 
-    def run(self, *, target_network, ssh_username, ssh_password, timeout, concurrency):
+    def run(self, *, target_network, ssh_username, ssh_password, ssh_port=22, timeout, concurrency, dryrun=False):
         config = get_plugin_config()
+        ssh_username = ssh_username or config.get("ssh_username", "admin")
+        ssh_password = ssh_password or config.get("ssh_password", "")
+        ssh_port = ssh_port or config.get("ssh_port", 22)
+        timeout = timeout or config.get("ssh_timeout", 10)
 
         network = IPNetwork(target_network)
         scan_name = f"SSH Scan: {network}"
@@ -1058,6 +1210,9 @@ class SSHDiscoveryJob(Job):
                     ssh_password,
                     timeout=timeout,
                     banner_timeout=config.get("ssh_banner_timeout", 30),
+                    port=ssh_port,
+                    enable_password=config.get("ssh_enable_password"),
+                    port_check=config.get("ssh_port_check", True),
                 )
                 if not info:
                     return
@@ -1065,17 +1220,22 @@ class SSHDiscoveryJob(Job):
                 with lock:
                     discovered += 1
 
-                device, result_status, error = create_device_in_nautobot(
-                    info["hostname"],
-                    ip_str,
-                    info["vendor"],
-                    info["model"],
-                    info["serial"],
-                    info["os_version"],
-                    None,
-                    config,
-                    discovery_scan,
-                )
+                if dryrun:
+                    device = None
+                    result_status = "new"
+                    error = "Dry-run: device discovered but not created"
+                else:
+                    device, result_status, error = create_device_in_nautobot(
+                        info["hostname"],
+                        ip_str,
+                        info["vendor"],
+                        info["model"],
+                        info["serial"],
+                        info["os_version"],
+                        None,
+                        config,
+                        discovery_scan,
+                    )
 
                 DiscoveryResult.objects.create(
                     scan=discovery_scan,
@@ -1090,21 +1250,24 @@ class SSHDiscoveryJob(Job):
                     result_status=result_status,
                     nautobot_device=device,
                     error_message=error,
+                    discovered_data={"command_outputs": info.get("command_outputs", {})},
                 )
 
                 with lock:
                     if result_status == "new":
-                        created += 1
+                        if not dryrun:
+                            created += 1
                     elif result_status == "existing":
                         existing += 1
                     else:
                         failed += 1
 
                 self.logger.info(
-                    "SSH: %s -> %s (%s)",
+                    "SSH: %s -> %s (%s)%s",
                     ip_str,
                     info["hostname"],
                     result_status,
+                    " [dry-run]" if dryrun else "",
                 )
 
             except Exception as exc:
@@ -1235,6 +1398,9 @@ class FullDiscoveryJob(Job):
         config["populate_interfaces"] = populate_interfaces
         config["populate_ip_addresses"] = populate_ip_addresses
         config["include_neighbors"] = include_neighbors
+        ssh_username = ssh_username or config.get("ssh_username", "admin")
+        ssh_password = ssh_password or config.get("ssh_password", "")
+        ssh_port = config.get("ssh_port", 22)
         network = IPNetwork(target_network)
         scan_name = f"Full Scan: {network}"
 
@@ -1364,6 +1530,9 @@ class FullDiscoveryJob(Job):
                         ip_str, ssh_username, ssh_password,
                         timeout=timeout,
                         banner_timeout=config.get("ssh_banner_timeout", 30),
+                        port=ssh_port,
+                        enable_password=config.get("ssh_enable_password"),
+                        port_check=config.get("ssh_port_check", True),
                     )
                     if not info:
                         return
@@ -1395,6 +1564,7 @@ class FullDiscoveryJob(Job):
                         result_status=result_status,
                         nautobot_device=device,
                         error_message=error,
+                        discovered_data={"command_outputs": info.get("command_outputs", {})},
                     )
 
                     with lock:

@@ -81,6 +81,10 @@ PLUGINS_CONFIG = {
         "max_walk_oids": 1000,
         "ssh_timeout": 10,
         "ssh_banner_timeout": 30,
+        "ssh_port": 22,
+        "ssh_username": "admin",
+        "ssh_password": "",
+        "ssh_port_check": True,
         "ping_timeout": 2,
         "concurrency": 10,
     },
@@ -122,8 +126,26 @@ Discovers devices via SSH:
 
 1. Navigate to **Jobs > SSH Discovery**
 2. Enter target network
-3. Provide SSH username and password
-4. Run the job
+3. Provide SSH username and password (or leave empty to use plugin config defaults)
+4. Optionally set a non-default **SSH port**
+5. Run the job
+
+For each reachable host, the job opens a PTY-backed interactive shell, disables
+paging, escalates to privileged exec when the login prompt requires it, and runs
+vendor-specific identification commands:
+
+- **Cisco** — `show version` + `show inventory`
+- **Juniper** — `show version` + `show chassis hardware`
+- **Arista / Ubiquiti / EdgeOS** — `show version`
+- **HPE Comware** — `display version` + `display device manuinfo`
+- **Nokia SR OS** — `show system version` + `show system information`
+- **FortiGate** — `get system status`
+- **Palo Alto** — `show system info`
+
+Vendor is detected from the login banner and/or the first command response;
+unknown vendors fall back to a generic command list. Raw command output is
+stored on the `DiscoveryResult` (`discovered_data.command_outputs`) for review,
+including in dry-run mode.
 
 > **Recommendation:** Store credentials in Nautobot Secrets (using Environment Variables or Vault provider) and paste the values into the job inputs.
 
@@ -192,6 +214,11 @@ For SSH-discovered devices, vendor detection is done via keyword matching on com
 | `max_walk_oids` | `1000` | Cap on rows walked per MIB table |
 | `ssh_timeout` | `10` | SSH connection timeout in seconds |
 | `ssh_banner_timeout` | `30` | SSH banner wait timeout in seconds |
+| `ssh_port` | `22` | SSH port used for discovery |
+| `ssh_username` | `"admin"` | Default SSH username (used when the job input is left empty) |
+| `ssh_password` | `""` | Default SSH password (used when the job input is left empty) |
+| `ssh_port_check` | `True` | TCP-port-check the host before attempting the SSH handshake |
+| `ssh_enable_password` | `""` | Enable password used when a device requires privilege escalation |
 | `ping_timeout` | `2` | ICMP ping timeout in seconds |
 | `concurrency` | `10` | Max concurrent probes |
 

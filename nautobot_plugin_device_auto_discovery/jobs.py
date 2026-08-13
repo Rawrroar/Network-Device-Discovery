@@ -40,7 +40,7 @@ from nautobot.ipam.models import IPAddress
 
 from .models import DiscoveryScan, DiscoveryResult
 from .mappings import lookup_platform_from_oid
-from .snmp_tables import discover_snmp_tables, find_chassis_serial, snmp_get
+from .snmp_tables import discover_snmp_tables, find_chassis_model, find_chassis_serial, snmp_get
 from .ssh_profiles import SSH_PROFILES, GENERIC_INFO_COMMANDS
 
 # Common SNMP constants kept for backward compatibility
@@ -61,10 +61,11 @@ VENDOR_KEYWORDS = {
     "arista": "Arista Networks",
     "hp|hpe|procurve": "HPE",
     "nokia|alcatel": "Nokia",
-    "ubiquiti|edge|unifi": "Ubiquiti",
+    "ubiquiti|edge|unifi|ucos|dream machine": "Ubiquiti",
     "f5|bigip": "F5 Networks",
     "palo alto|panos|paloalto": "Palo Alto Networks",
     "fortinet|forti": "Fortinet",
+    "epson": "Seiko Epson",
 }
 
 # Vendor-specific regexes used to extract a model from sysDescr.
@@ -251,6 +252,32 @@ def resolve_nautobot_objects(hostname, ip_str, vendor, model, serial, os_version
     # Check if device already exists
     existing_device = Device.objects.filter(name=hostname).first()
     if existing_device:
+        # Upgrade devices that were previously auto-created with no usable
+        # model/vendor info (e.g. a "Unknown" device type). Only touch fields
+        # that are placeholder/empty so manual data is never overwritten.
+        needs_device_save = False
+        current_type = existing_device.device_type.model if existing_device.device_type else ""
+        current_mfr = (
+            existing_device.device_type.manufacturer.name
+            if existing_device.device_type and existing_device.device_type.manufacturer
+            else ""
+        )
+        is_placeholder_type = (not current_type) or current_type.lower() in ("unknown", "default")
+
+        if model and is_placeholder_type:
+            existing_device.device_type = device_type
+            needs_device_save = True
+        elif is_placeholder_type and current_mfr == "Unknown" and manufacturer.name != "Unknown":
+            existing_device.device_type.manufacturer = manufacturer
+            existing_device.device_type.save()
+
+        if not existing_device.platform and platform:
+            existing_device.platform = platform
+            needs_device_save = True
+
+        if needs_device_save:
+            existing_device.save()
+
         return {
             "device": existing_device,
             "platform": platform,
@@ -512,9 +539,25 @@ def snmp_discover_device(ip_str, config):
     if not vendor and platform_info:
         vendor = platform_info.get("manufacturer_name", "")
     model = parse_model_from_descr(sys_descr, vendor)
+    if not model and sys_name:
+        model = parse_model_from_descr(sys_name, vendor)
     os_version = parse_os_version_from_descr(sys_descr)
 
     serial = find_chassis_serial(tables["physical"]) or ""
+
+    if not vendor:
+        # The sysDescr may be sparse/empty; the ENTITY-MIB physical
+        # inventory descriptions often carry the vendor/product name.
+        physical_blob = " ".join(
+            str(v)
+            for e in tables["physical"]
+            for v in (e.get("descr"), e.get("model"), e.get("name"))
+            if v
+        )
+        vendor = detect_vendor_from_descr(physical_blob)
+
+    if not model:
+        model = find_chassis_model(tables["physical"]) or ""
 
     return {
         "hostname": sys_name or ip_str,

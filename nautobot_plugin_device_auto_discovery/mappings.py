@@ -35,6 +35,11 @@ SNMP_OID_MAPPING = [
     ("1.3.6.1.4.1.41112.1.5", "Ubiquiti EdgeMAX", "Ubiquiti", "edgeos"),
     ("1.3.6.1.4.1.41112.1.6", "Ubiquiti UniFi", "Ubiquiti", ""),
     ("1.3.6.1.4.1.41112.1.10", "Ubiquiti UniFi", "Ubiquiti", ""),
+    ("1.3.6.1.4.1.41112.1", "Ubiquiti UniFi", "Ubiquiti", ""),
+    ("1.3.6.1.4.1.41112", "Ubiquiti UniFi", "Ubiquiti", ""),
+    # Epson printers
+    ("1.3.6.1.4.1.1248.1", "Epson", "Seiko Epson", ""),
+    ("1.3.6.1.4.1.1248", "Epson", "Seiko Epson", ""),
     # Linux hosts
     ("1.3.6.1.4.1.8072.3.2.10", "Linux", "Linux", "linux"),
 ]

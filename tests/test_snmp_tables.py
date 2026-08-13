@@ -14,6 +14,7 @@ from nautobot_plugin_device_auto_discovery.snmp_tables import (
     collect_physical,
     collect_system,
     discover_snmp_tables,
+    find_chassis_model,
     find_chassis_serial,
     mac_from_bytes,
 )
@@ -213,6 +214,30 @@ class CollectPhysicalTests(TestCase):
     def test_find_chassis_serial_none(self):
         self.assertIsNone(find_chassis_serial([]))
         self.assertIsNone(find_chassis_serial([{"class": 3, "serial": ""}]))
+
+    def test_find_chassis_model_prefers_chassis_model_name(self):
+        physical = [
+            {"class": 9, "model": "PSU-900", "descr": "Power Supply 900W"},
+            {"class": 3, "model": "WS-C2960-24TT-L", "descr": "Catalyst 2960 24-Port"},
+        ]
+        self.assertEqual(find_chassis_model(physical), "WS-C2960-24TT-L")
+
+    def test_find_chassis_model_falls_back_to_chassis_descr(self):
+        physical = [
+            {"class": 3, "model": "", "descr": "UniFi U7 Pro"},
+        ]
+        self.assertEqual(find_chassis_model(physical), "UniFi U7 Pro")
+
+    def test_find_chassis_model_uses_any_entity_model(self):
+        physical = [
+            {"class": 3, "model": "", "descr": "Chassis"},
+            {"class": 7, "model": "UCG-Fiber", "descr": "Cloud Gateway"},
+        ]
+        self.assertEqual(find_chassis_model(physical), "UCG-Fiber")
+
+    def test_find_chassis_model_none(self):
+        self.assertIsNone(find_chassis_model([]))
+        self.assertIsNone(find_chassis_model([{"class": 3, "model": "", "descr": ""}]))
 
 
 class CollectNeighborsTests(TestCase):

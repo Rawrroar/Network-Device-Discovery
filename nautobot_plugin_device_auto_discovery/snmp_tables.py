@@ -17,6 +17,7 @@ aborts discovery of the device.
 
 import asyncio
 import logging
+import re
 import threading
 
 from netaddr import IPAddress
@@ -544,6 +545,51 @@ def find_chassis_serial(physical):
     for entity in physical:
         if entity.get("serial"):
             return entity["serial"]
+    return None
+
+
+def find_chassis_model(physical):
+    """Extract a product model from ENTITY-MIB data.
+
+    Prefers the chassis (class 3) entity's model name, then its description;
+    falls back to any entity with a model name or a usable description.
+
+    Returns:
+        str model, or None if nothing usable is found.
+    """
+    if not physical:
+        return None
+
+    def _clean(value):
+        cleaned = (value or "").strip()
+        if not cleaned:
+            return ""
+        # Drop parenthetical/boilerplate additions and trailing version markers.
+        cleaned = re.split(r"\s*(?:\(\w+\)|\[.*\]|,)", cleaned, maxsplit=1)[0].strip()
+        return cleaned
+
+    candidates = []
+    for entity in physical:
+        model = _clean(entity.get("model"))
+        if model:
+            candidates.append(model)
+    for entity in physical:
+        if entity.get("class") == 3 and _clean(entity.get("descr")):
+            candidates.append(_clean(entity["descr"]))
+
+    # Most specific-looking candidate wins: chassis entity first.
+    for entity in physical:
+        if entity.get("class") == 3:
+            model = _clean(entity.get("model"))
+            if model:
+                return model
+    for entity in physical:
+        if entity.get("class") == 3:
+            descr = _clean(entity.get("descr"))
+            if descr:
+                return descr
+    for model in candidates:
+        return model
     return None
 
 

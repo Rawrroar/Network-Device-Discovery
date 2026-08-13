@@ -24,6 +24,9 @@ from nautobot_plugin_device_auto_discovery.jobs import (
     get_or_create_device_type,
     ssh_connect_and_discover,
     tcp_port_open,
+    detect_vendor_from_descr,
+    parse_model_from_descr,
+    snmp_discover_device,
     _parse_ssh_output,
 )
 
@@ -72,6 +75,74 @@ class OIDMappingTests(TestCase):
     def test_ubiquiti_edgeos(self):
         result = lookup_platform_from_oid("1.3.6.1.4.1.41112.1.3.1")
         self.assertEqual(result["platform_name"], "Ubiquiti EdgeOS")
+
+    def test_ubiquiti_unifi_generic_oid(self):
+        result = lookup_platform_from_oid("1.3.6.1.4.1.41112.1.11.1")
+        self.assertEqual(result["platform_name"], "Ubiquiti UniFi")
+        self.assertEqual(result["manufacturer_name"], "Ubiquiti")
+
+    def test_epson(self):
+        result = lookup_platform_from_oid("1.3.6.1.4.1.1248.1.1.1")
+        self.assertEqual(result["manufacturer_name"], "Seiko Epson")
+
+    def test_epson_generic_oid(self):
+        result = lookup_platform_from_oid("1.3.6.1.4.1.1248.3.2")
+        self.assertEqual(result["manufacturer_name"], "Seiko Epson")
+
+    def test_vendor_detection_epson(self):
+        self.assertEqual(detect_vendor_from_descr("EPSON XP-8700"), "Seiko Epson")
+
+    def test_vendor_detection_ucos(self):
+        self.assertEqual(detect_vendor_from_descr("UCOS 4.1.16850"), "Ubiquiti")
+
+
+class SNMPDetectionTests(TestCase):
+    """Unit tests for vendor/model detection in snmp_discover_device."""
+
+    def _run(self, system, physical):
+        with patch(
+            "nautobot_plugin_device_auto_discovery.jobs.discover_snmp_tables",
+            return_value={
+                "system": system,
+                "physical": physical,
+                "interfaces": [],
+                "ip_addresses": [],
+                "arp_table": [],
+                "neighbors": [],
+            },
+        ):
+            return snmp_discover_device("10.0.0.1", {"snmp_community": "public"})
+
+    def test_vendor_and_model_from_physical_inventory(self):
+        info = self._run(
+            {"sys_name": "CoreSwitch", "sys_descr": "UCOS 4.1.16850", "sys_object_id": ""},
+            [{"class": 3, "model": "", "descr": "UniFi U7 Pro", "serial": "788a200cea7d"}],
+        )
+        self.assertEqual(info["vendor"], "Ubiquiti")
+        self.assertEqual(info["model"], "UniFi U7 Pro")
+
+    def test_ucos_vendor_detected_from_sysdescr(self):
+        info = self._run(
+            {"sys_name": "DownstairsAP", "sys_descr": "UCOS 8.2.15592", "sys_object_id": ""},
+            [],
+        )
+        self.assertEqual(info["vendor"], "Ubiquiti")
+        self.assertEqual(info["os_version"], "8.2.15592")
+
+    def test_epson_vendor_from_oid_with_empty_descr(self):
+        info = self._run(
+            {"sys_name": "EPSON88D351", "sys_descr": "", "sys_object_id": "1.3.6.1.4.1.1248.1.1.2"},
+            [],
+        )
+        self.assertEqual(info["vendor"], "Seiko Epson")
+
+    def test_model_falls_back_to_sysname(self):
+        info = self._run(
+            {"sys_name": "UCG-Fiber", "sys_descr": "Ubiquiti UniFi", "sys_object_id": ""},
+            [],
+        )
+        self.assertEqual(info["vendor"], "Ubiquiti")
+        self.assertEqual(info["model"], "UCG-Fiber")
 
 
 class HelperFunctionTests(TestCase):

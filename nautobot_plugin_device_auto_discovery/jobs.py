@@ -5,6 +5,7 @@ and a full discovery orchestrator that combines all methods.
 """
 
 import logging
+import re
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,6 +51,84 @@ from .snmp_tables import (
 )
 
 OPER_STATUS_UP = 1
+
+
+VENDOR_KEYWORDS = {
+    "cisco": "Cisco",
+    "juniper": "Juniper Networks",
+    "arista": "Arista Networks",
+    "hp|hpe|procurve": "HPE",
+    "nokia|alcatel": "Nokia",
+    "ubiquiti|edge|unifi": "Ubiquiti",
+    "f5|bigip": "F5 Networks",
+    "palo alto|panos|paloalto": "Palo Alto Networks",
+    "fortinet|forti": "Fortinet",
+}
+
+# Vendor-specific regexes used to extract a model from sysDescr.
+VENDOR_MODEL_PATTERNS = {
+    "Ubiquiti": [r"\bUniFi\s+([A-Za-z0-9][A-Za-z0-9\-]*)", r"\b(?:USW|UCG|UDM|UAP|USG)[A-Za-z0-9\-]*"],
+    "Cisco": [r"\b(C[A-Z0-9]{2,6}(?:-[A-Z0-9]+)+)\b"],
+    "Arista Networks": [r"\b(DCS(?:-[A-Za-z0-9]+)+)\b"],
+    "Juniper Networks": [r"\b(ex\d+|mx\d+|qfx\d+|srx\d+)\b"],
+    "HPE": [r"\b(?:HP\s+)?(?:Aruba|ProCurve|Comware|FlexFabric)\s+([A-Za-z0-9\-]+)"],
+}
+
+# sysLocation/sysContact values that mean "not configured" and should be ignored.
+PLACEHOLDER_SYSTEM_VALUES = {"", "location", "contact", "unknown", "none", "n/a", "na", "0", "not set", "not available"}
+
+
+def detect_vendor_from_descr(sys_descr):
+    """Detect the vendor name from a sysDescr string using keyword patterns."""
+    if not sys_descr:
+        return ""
+    for pattern, vendor_name in VENDOR_KEYWORDS.items():
+        if re.search(pattern, sys_descr, re.IGNORECASE):
+            return vendor_name
+    return ""
+
+
+def parse_model_from_descr(sys_descr, vendor=""):
+    """Extract a device model from sysDescr.
+
+    Uses vendor-specific patterns first, then falls back to the first
+    alphanumeric token that looks like a product name.
+    """
+    if not sys_descr:
+        return ""
+    for regex in VENDOR_MODEL_PATTERNS.get(vendor, []):
+        match = re.search(regex, sys_descr, re.IGNORECASE)
+        if match:
+            return match.group(1) if match.groups() else match.group(0).strip()
+    for token in sys_descr.split():
+        if not re.match(r"^[A-Za-z][A-Za-z0-9\-_.]*$", token):
+            continue
+        if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token)):
+            continue
+        if re.match(r"^\d+(\.\d+)+$", token):
+            continue
+        return token
+    return ""
+
+
+def parse_os_version_from_descr(sys_descr):
+    """Extract an OS/software version from sysDescr."""
+    if not sys_descr:
+        return ""
+    for pattern in (r"Version\s+([0-9.]+)", r"version\s+([0-9.]+)", r"\bv(\d+(?:\.\d+)+)"):
+        match = re.search(pattern, sys_descr)
+        if match:
+            return match.group(1)
+    match = re.search(r"(?<![\w])(\d+\.\d+(?:\.\d+)?)(?![\w.])", sys_descr)
+    return match.group(1) if match else ""
+
+
+def clean_system_scalar(value):
+    """Strip placeholder/default sysLocation/sysContact values to empty string."""
+    cleaned = (value or "").strip()
+    if cleaned.lower() in PLACEHOLDER_SYSTEM_VALUES:
+        return ""
+    return cleaned
 
 
 logger = logging.getLogger(__name__.split(".")[0])
@@ -249,10 +328,10 @@ def create_device_in_nautobot(
 
         # Populate interfaces / IP addresses from SNMP tables
         if discovered_info:
-            populate_device_from_snmp(device, discovered_info, config)
+            populate_device_from_snmp(device, discovered_info, config, ip_str)
 
-        # Assign primary IP
-        if ip_str:
+        # Assign primary IP (fallback) if not already set by SNMP table population
+        if ip_str and not device.primary_ip4:
             try:
                 ip_obj, _ = IPAddress.objects.get_or_create(
                     address=ip_str + "/32",
@@ -261,7 +340,7 @@ def create_device_in_nautobot(
                     },
                 )
                 device.primary_ip4 = ip_obj
-                device.save()
+                device.save(update_fields=["primary_ip4"])
             except Exception as ip_err:
                 logger.warning("Could not assign primary IP %s: %s", ip_str, ip_err)
 
@@ -427,14 +506,11 @@ def snmp_discover_device(ip_str, config):
 
     platform_info = lookup_platform_from_oid(sys_object_id)
 
-    vendor = ""
-    model = ""
-    if sys_descr:
-        parts = sys_descr.split(",")
-        if parts:
-            vendor = parts[0].strip()
-        if len(parts) > 1:
-            model = parts[1].strip()
+    vendor = detect_vendor_from_descr(sys_descr)
+    if not vendor and platform_info:
+        vendor = platform_info.get("manufacturer_name", "")
+    model = parse_model_from_descr(sys_descr, vendor)
+    os_version = parse_os_version_from_descr(sys_descr)
 
     serial = find_chassis_serial(tables["physical"]) or ""
 
@@ -446,9 +522,9 @@ def snmp_discover_device(ip_str, config):
         "vendor": vendor,
         "model": model,
         "serial": serial,
-        "os_version": sys_descr or "",
-        "sys_contact": system.get("sys_contact", ""),
-        "sys_location": system.get("sys_location", ""),
+        "os_version": os_version,
+        "sys_contact": clean_system_scalar(system.get("sys_contact")),
+        "sys_location": clean_system_scalar(system.get("sys_location")),
         "interfaces": tables["interfaces"],
         "ip_addresses": tables["ip_addresses"],
         "arp_table": tables["arp_table"],
@@ -485,12 +561,15 @@ def _interface_enabled(iface_row):
     return True
 
 
-def populate_device_from_snmp(device, info, config):
+def populate_device_from_snmp(device, info, config, ip_str=None):
     """Populate Device, Interface, and IPAddress objects from SNMP tables.
 
     Creates dcim.Interface objects from the IF-MIB table and assigns
     ipam.IPAddress objects (from IP-MIB) to the matching interfaces.
     Operates idempotently: existing interfaces/IPs are matched by name/address.
+
+    If ``ip_str`` matches one of the discovered addresses, that IP is set as
+    the Device primary IP (using the discovered prefix length).
 
     Returns:
         dict with counts: interfaces_created, ip_addresses_created
@@ -549,15 +628,16 @@ def populate_device_from_snmp(device, info, config):
             logger.debug("Failed to create interface %s on %s: %s", name, device.name, exc)
 
     active_ip_status = get_ip_address_status()
+    primary_ip_obj = None
     for ip_row in ip_addresses_data:
         address = ip_row.get("address")
         if not address:
             continue
         prefix = ip_row.get("prefix_length") or 32
-        ip_str = f"{address}/{prefix}"
+        ip_str_full = f"{address}/{prefix}"
         try:
             ip_obj, created = IPAddress.objects.get_or_create(
-                address=ip_str,
+                address=ip_str_full,
                 defaults={"status": active_ip_status},
             )
             if created:
@@ -566,8 +646,14 @@ def populate_device_from_snmp(device, info, config):
             if iface and not ip_obj.assigned_object_id:
                 ip_obj.assigned_object = iface
                 ip_obj.save()
+            if ip_str and str(address) == str(ip_str):
+                primary_ip_obj = ip_obj
         except Exception as exc:
-            logger.debug("Failed to assign IP %s on %s: %s", ip_str, device.name, exc)
+            logger.debug("Failed to assign IP %s on %s: %s", ip_str_full, device.name, exc)
+
+    if primary_ip_obj and not device.primary_ip4:
+        device.primary_ip4 = primary_ip_obj
+        device.save(update_fields=["primary_ip4"])
 
     return counts
 
@@ -856,18 +942,7 @@ def ssh_connect_and_discover(ip_str, username, password, timeout=10, banner_time
                 model = model_match.group(1).strip()
 
             # Detect vendor from output
-            vendor_keywords = {
-                "cisco": "Cisco",
-                "juniper": "Juniper Networks",
-                "arista": "Arista Networks",
-                "hp|hpe|procurve": "HPE",
-                "nokia|alcatel": "Nokia",
-                "ubiquiti|edge": "Ubiquiti",
-                "f5": "F5 Networks",
-                "palo alto|panos": "Palo Alto Networks",
-                "fortinet|forti": "Fortinet",
-            }
-            for pattern, vendor_name in vendor_keywords.items():
+            for pattern, vendor_name in VENDOR_KEYWORDS.items():
                 if re.search(pattern, output, re.IGNORECASE):
                     vendor = vendor_name
                     break

@@ -341,9 +341,9 @@ def mac_from_bytes(raw):
         return None
 
 
-def _if_type_name(code):
+def _if_type_name(code, speed=None):
     """Map a numeric IANA ifType to a Nautobot InterfaceTypeChoices value."""
-    return lookup_interface_type(code)
+    return lookup_interface_type(code, speed)
 
 
 # ------------------------------------------------------------------ #
@@ -416,7 +416,7 @@ def collect_interfaces(ip_str, config, max_rows=1000):
                 "index": index,
                 "name": name_map.get(index) or descr_map[index],
                 "descr": descr_map[index],
-                "type": _if_type_name(type_map.get(index, "")),
+                "type": _if_type_name(type_map.get(index, ""), speed_kbps),
                 "mtu": int(float(mtu_map[index])) if index in mtu_map else None,
                 "speed": speed_kbps,
                 "mac": mac or "",

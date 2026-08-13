@@ -40,14 +40,19 @@ class MACFormattingTests(TestCase):
 
 
 class InterfaceTypeMappingTests(TestCase):
-    def test_ethernet(self):
-        self.assertEqual(lookup_interface_type(6), "ethernet-csmacd")
+    def test_ethernet_without_speed(self):
+        self.assertEqual(lookup_interface_type(6), "other")
+
+    def test_ethernet_refined_by_speed(self):
+        self.assertEqual(lookup_interface_type(6, 100000), "100base-tx")
+        self.assertEqual(lookup_interface_type(6, 1000000), "1000base-t")
+        self.assertEqual(lookup_interface_type(6, 10000000), "10gbase-t")
 
     def test_lag(self):
-        self.assertEqual(lookup_interface_type(161), "ieee8023adLag")
+        self.assertEqual(lookup_interface_type(161), "lag")
 
     def test_loopback(self):
-        self.assertEqual(lookup_interface_type(24), "softwareLoopback")
+        self.assertEqual(lookup_interface_type(24), "virtual")
 
     def test_unknown_type_falls_back(self):
         self.assertEqual(lookup_interface_type(999), "other")
@@ -85,7 +90,7 @@ class CollectInterfacesTests(TestCase):
         first, second = interfaces
 
         self.assertEqual(first["name"], "GigabitEthernet0/0/1")
-        self.assertEqual(first["type"], "ethernet-csmacd")
+        self.assertEqual(first["type"], "1000base-t")  # ifType 6 + ifHighSpeed 1000 Mbps
         self.assertEqual(first["mtu"], 1500)
         self.assertEqual(first["speed"], 1000000)  # ifHighSpeed 1000 Mbps -> Kbps
         self.assertEqual(first["mac"], "00:11:22:33:44:55")
@@ -93,7 +98,7 @@ class CollectInterfacesTests(TestCase):
         self.assertEqual(first["alias"], "Uplink")
 
         self.assertEqual(second["name"], "Port-channel1")
-        self.assertEqual(second["type"], "ieee8023adLag")
+        self.assertEqual(second["type"], "lag")
         self.assertEqual(second["speed"], 10000)  # ifHighSpeed 10 Mbps -> Kbps
 
     def test_empty_table_returns_empty(self):

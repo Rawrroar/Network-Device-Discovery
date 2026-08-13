@@ -310,7 +310,7 @@ class SNMPDiscoveryJobTests(TestCase):
                         "index": "1",
                         "name": "GigabitEthernet0/0/1",
                         "descr": "GigabitEthernet0/0/1",
-                        "type": "ethernet-csmacd",
+                        "type": "1000base-t",
                         "mtu": 1500,
                         "speed": 1000000,
                         "mac": "00:11:22:33:44:55",
@@ -322,7 +322,7 @@ class SNMPDiscoveryJobTests(TestCase):
                         "index": "2",
                         "name": "Loopback0",
                         "descr": "Loopback0",
-                        "type": "softwareLoopback",
+                        "type": "virtual",
                         "mtu": 1514,
                         "speed": None,
                         "mac": "",
@@ -375,16 +375,17 @@ class SNMPDiscoveryJobTests(TestCase):
         self.assertEqual(str(device.serial), "FCW2134ABCD")
 
         iface = Interface.objects.get(device=device, name="GigabitEthernet0/0/1")
-        self.assertEqual(iface.type, "ethernet-csmacd")
+        self.assertEqual(iface.type, "1000base-t")
         self.assertEqual(iface.mac_address, "00:11:22:33:44:55")
         self.assertEqual(iface.speed, 1000000)
         self.assertEqual(iface.description, "Uplink")
         self.assertTrue(iface.enabled)
 
-        self.assertTrue(Interface.objects.filter(device=device, name="Loopback0", type="softwareLoopback").exists())
+        self.assertTrue(Interface.objects.filter(device=device, name="Loopback0", type="virtual").exists())
 
         ip_obj = IPAddress.objects.get(address="10.0.0.1/24")
         self.assertEqual(ip_obj.assigned_object, iface)
+        self.assertEqual(device.primary_ip4, ip_obj)
 
         discovery_result = DiscoveryResult.objects.get(ip_address="10.0.0.1")
         self.assertEqual(discovery_result.interfaces_found, 2)

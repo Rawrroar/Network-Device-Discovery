@@ -59,12 +59,10 @@ def get_or_create_default_location(config):
 def get_or_create_default_role(config):
     """Get or create the default DeviceRole for discovered devices."""
     role_name = config.get("default_role", "Network Device")
-    status = Status.objects.get_for_model(Role).first()
     role, _ = Role.objects.get_or_create(
         name=role_name,
         defaults={
             "color": "blue",
-            "status": status,
         },
     )
     return role

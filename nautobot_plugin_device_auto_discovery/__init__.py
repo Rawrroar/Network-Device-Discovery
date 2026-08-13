@@ -6,6 +6,7 @@ from nautobot.apps import NautobotAppConfig
 DEFAULT_PLUGINS_CONFIG = {
     "default_location": "Unknown",
     "default_role": "Network Device",
+    "default_role_color": "006cd1",
     "default_status": "Active",
     "default_tags": ["auto-discovered"],
     "create_missing_objects": True,

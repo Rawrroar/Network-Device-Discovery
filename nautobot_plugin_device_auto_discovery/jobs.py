@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from netaddr import IPNetwork, IPAddress
 
 from nautobot.apps.jobs import (
@@ -149,6 +150,11 @@ def get_or_create_default_location(config):
         name=location_name + " Type",
         defaults={"nestable": True},
     )
+    # Nautobot 3.x: a LocationType must list dcim.device in its
+    # content_types for Devices to be valid in its Locations.
+    device_content_type = ContentType.objects.get_for_model(Device)
+    if device_content_type not in location_type.content_types.all():
+        location_type.content_types.add(device_content_type)
     status = Status.objects.get_for_model(Location).first()
     location, _ = Location.objects.get_or_create(
         name=location_name,
@@ -166,9 +172,15 @@ def get_or_create_default_role(config):
     role, _ = Role.objects.get_or_create(
         name=role_name,
         defaults={
-            "color": "blue",
+            # Nautobot 3.x expects a hex RGB code, not a named color.
+            "color": config.get("default_role_color", "006cd1"),
         },
     )
+    # Nautobot 3.x: a Role must list dcim.device in its content_types
+    # to be a valid role choice for Devices.
+    device_content_type = ContentType.objects.get_for_model(Device)
+    if device_content_type not in role.content_types.all():
+        role.content_types.add(device_content_type)
     return role
 
 
@@ -274,6 +286,18 @@ def resolve_nautobot_objects(hostname, ip_str, vendor, model, serial, os_version
         if not existing_device.platform and platform:
             existing_device.platform = platform
             needs_device_save = True
+        elif existing_device.platform and manufacturer.name != "Unknown":
+            # Keep the platform in sync when the device type was upgraded from
+            # a placeholder: a platform whose manufacturer is a stale "Unknown"
+            # makes the Device fail validation ("platform is limited to ...").
+            current_platform_mfr = (
+                existing_device.platform.manufacturer.name
+                if existing_device.platform.manufacturer
+                else ""
+            )
+            if current_platform_mfr == "Unknown":
+                existing_device.platform.manufacturer = manufacturer
+                existing_device.platform.save()
 
         if serial and not existing_device.serial:
             existing_device.serial = serial

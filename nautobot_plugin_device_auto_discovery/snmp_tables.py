@@ -709,6 +709,17 @@ def discover_snmp_tables(ip_str, config):
         "neighbors": [],
     }
 
+    # Quick reachability probe: a host that does not answer SNMP at all
+    # would otherwise burn a multi-second timeout on *every* scalar GET
+    # and column walk below (~150s per silent host). One sysName GET is
+    # enough to decide that SNMP is not available and skip the rest.
+    community = config.get("snmp_community", "public")
+    timeout = config.get("snmp_timeout", 3)
+    retries = config.get("snmp_retries", 2)
+    if not snmp_get(ip_str, OID_SYSNAME, community, timeout, retries):
+        logger.debug("SNMP not responding on %s; skipping table walks", ip_str)
+        return tables
+
     try:
         tables["system"] = collect_system(ip_str, config)
     except Exception as exc:

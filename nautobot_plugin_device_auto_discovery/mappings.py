@@ -55,3 +55,27 @@ def lookup_platform_from_oid(sys_object_id):
                 "network_driver": network_driver,
             }
     return None
+
+
+# Map numeric IANA ifType (RFC 2863) values to Nautobot dcim.InterfaceTypeChoices.
+IF_TYPE_MAPPING = {
+    6: "ethernet-csmacd",
+    24: "softwareLoopback",
+    53: "propVirtual",
+    131: "tunnel",
+    135: "l2vlan",
+    136: "l3ipvlan",
+    161: "ieee8023adLag",
+}
+
+
+def lookup_interface_type(if_type_code):
+    """Map an IANA ifType code to a Nautobot InterfaceTypeChoices value.
+
+    Returns:
+        str type value, or "other" if unknown.
+    """
+    try:
+        return IF_TYPE_MAPPING.get(int(if_type_code), "other")
+    except (TypeError, ValueError):
+        return "other"

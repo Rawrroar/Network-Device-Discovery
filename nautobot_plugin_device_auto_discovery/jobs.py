@@ -14,6 +14,7 @@ from netaddr import IPNetwork, IPAddress
 
 from nautobot.apps.jobs import (
     BooleanVar,
+    DryRunVar,
     IntegerVar,
     IPNetworkVar,
     Job,
@@ -22,12 +23,33 @@ from nautobot.apps.jobs import (
     StringVar,
     TextVar,
 )
-from nautobot.dcim.models import Device, DeviceType, Location, LocationType, Manufacturer, Platform
+from nautobot.dcim.models import (
+    Device,
+    DeviceType,
+    Interface,
+    Location,
+    LocationType,
+    Manufacturer,
+    Platform,
+)
 from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
+from nautobot.ipam.models import IPAddress
 
 from .models import DiscoveryScan, DiscoveryResult
 from .mappings import lookup_platform_from_oid
+from .snmp_tables import discover_snmp_tables, find_chassis_serial, snmp_get
+
+# Common SNMP constants kept for backward compatibility
+from .snmp_tables import (
+    OID_SYSCONTACT as SNMP_OID_SYSCONTACT,
+    OID_SYSDESCR as SNMP_OID_SYSDescR,
+    OID_SYSLOCATION as SNMP_OID_SYSLOCATION,
+    OID_SYSNAME as SNMP_OID_SYSNAME,
+    OID_SYSOBJECTID as SNMP_OID_SYSOBJECTID,
+)
+
+OPER_STATUS_UP = 1
 
 
 logger = logging.getLogger(__name__.split(".")[0])
@@ -171,8 +193,14 @@ def resolve_nautobot_objects(hostname, ip_str, vendor, model, serial, os_version
     }
 
 
-def create_device_in_nautobot(hostname, ip_str, vendor, model, serial, os_version, platform_info, config, discovery_scan):
+def create_device_in_nautobot(
+    hostname, ip_str, vendor, model, serial, os_version, platform_info, config, discovery_scan, discovered_info=None
+):
     """Create a Device object in Nautobot from discovered data.
+
+    When ``discovered_info`` (the dict from ``snmp_discover_device``) is
+    provided, interfaces and IP addresses discovered via SNMP are also
+    populated onto the Device.
 
     Returns:
         tuple: (device, result_status, error_message)
@@ -184,11 +212,24 @@ def create_device_in_nautobot(hostname, ip_str, vendor, model, serial, os_versio
         if not resolved:
             return None, "failed", "create_missing_objects is disabled in config"
 
+        discovered_info = discovered_info or {}
+        serial = serial or (discovered_info.get("serial") or "")
+        sys_contact = discovered_info.get("sys_contact") or ""
+        sys_location = discovered_info.get("sys_location") or ""
+
         if resolved["device"]:
             device = resolved["device"]
             status = "existing"
             logger.info("Device %s already exists in Nautobot", hostname)
         else:
+            comments = (
+                f"Auto-discovered via device-auto-discovery plugin.\n"
+                f"OS: {os_version}\nVendor: {vendor}\nModel: {model}"
+            )
+            if sys_location:
+                comments += f"\nLocation: {sys_location}"
+            if sys_contact:
+                comments += f"\nContact: {sys_contact}"
             device = Device.objects.create(
                 name=hostname,
                 platform=resolved["platform"],
@@ -197,7 +238,7 @@ def create_device_in_nautobot(hostname, ip_str, vendor, model, serial, os_versio
                 location=resolved["location"],
                 status=resolved["status"],
                 serial=serial or "",
-                comments=f"Auto-discovered via device-auto-discovery plugin.\nOS: {os_version}\nVendor: {vendor}\nModel: {model}",
+                comments=comments,
             )
             # Assign tags
             for tag_name in config.get("default_tags", ["auto-discovered"]):
@@ -206,10 +247,13 @@ def create_device_in_nautobot(hostname, ip_str, vendor, model, serial, os_versio
             status = "new"
             logger.info("Created device %s in Nautobot", hostname)
 
+        # Populate interfaces / IP addresses from SNMP tables
+        if discovered_info:
+            populate_device_from_snmp(device, discovered_info, config)
+
         # Assign primary IP
         if ip_str:
             try:
-                from nautobot.ipam.models import IPAddress
                 ip_obj, _ = IPAddress.objects.get_or_create(
                     address=ip_str + "/32",
                     defaults={
@@ -354,71 +398,24 @@ class PingSweepJob(Job):
 # ------------------------------------------------------------------ #
 
 
-SNMP_OID_SYSNAME = "1.3.6.1.2.1.1.5.0"
-SNMP_OID_SYSDescR = "1.3.6.1.2.1.1.1.0"
-SNMP_OID_SYSOBJECTID = "1.3.6.1.2.1.1.2.0"
-SNMP_OID_SYSCONTACT = "1.3.6.1.2.1.1.6.0"
-SNMP_OID_SYSLOCATION = "1.3.6.1.2.1.1.7.0"
-
-
-def snmp_get(ip_str, oid, community="public", timeout=3, retries=2, version="2c"):
-    """Perform an SNMP GET request.
-
-    Returns:
-        string value or None.
-    """
-    try:
-        from pysnmp.hlapi import (
-            SnmpEngine,
-            CommunityData,
-            UdpTransportTarget,
-            ContextData,
-            ObjectType,
-            ObjectIdentity,
-            getCmd,
-        )
-
-        engine = SnmpEngine()
-        if version == "2c":
-            cmdgen = getCmd(
-                engine,
-                CommunityData(community, mpModel=0),
-                UdpTransportTarget((ip_str, 161), timeout=timeout, retries=retries),
-                ContextData(),
-                ObjectType(ObjectIdentity(oid)),
-            )
-        else:
-            cmdgen = None
-            logger.debug("SNMPv3 not yet implemented for ip %s", ip_str)
-
-        if cmdgen:
-            error_indication, error_status, error_index, var_binds = next(cmdgen)
-            if not error_indication and not error_status and var_binds:
-                value = var_binds[0][1]
-                return str(value)
-    except ImportError:
-        logger.warning("pysnmp not installed; SNMP discovery will not work.")
-        return None
-    except Exception as exc:
-        logger.debug("SNMP GET failed for %s OID %s: %s", ip_str, oid, exc)
-        return None
-    return None
-
-
 def snmp_discover_device(ip_str, config):
-    """Discover device info via SNMP.
+    """Discover device info and common MIB tables via SNMP.
+
+    Walks the system scalars plus common tables (interfaces, IPs, ARP,
+    physical inventory, LLDP/CDP neighbors) for the host.
 
     Returns:
-        dict with hostname, sysdescr, sysobjectid, platform_info, vendor, model, serial
-        or None on failure.
+        dict with hostname, sysdescr, sysobjectid, platform_info, vendor,
+        model, serial, os_version, sys_contact, sys_location, interfaces,
+        ip_addresses, arp_table, physical, neighbors and table counts,
+        or None if the host is not SNMP-reachable.
     """
-    community = config.get("snmp_community", "public")
-    timeout = config.get("snmp_timeout", 3)
-    retries = config.get("snmp_retries", 2)
+    tables = discover_snmp_tables(ip_str, config)
+    system = tables["system"]
 
-    sys_name = snmp_get(ip_str, SNMP_OID_SYSNAME, community, timeout, retries)
-    sys_descr = snmp_get(ip_str, SNMP_OID_SYSDescR, community, timeout, retries)
-    sys_object_id = snmp_get(ip_str, SNMP_OID_SYSOBJECTID, community, timeout, retries)
+    sys_name = system.get("sys_name", "")
+    sys_descr = system.get("sys_descr", "")
+    sys_object_id = system.get("sys_object_id", "")
 
     if not sys_name and not sys_descr:
         return None
@@ -434,6 +431,8 @@ def snmp_discover_device(ip_str, config):
         if len(parts) > 1:
             model = parts[1].strip()
 
+    serial = find_chassis_serial(tables["physical"]) or ""
+
     return {
         "hostname": sys_name or ip_str,
         "sys_descr": sys_descr or "",
@@ -441,9 +440,131 @@ def snmp_discover_device(ip_str, config):
         "platform_info": platform_info,
         "vendor": vendor,
         "model": model,
-        "serial": "",
+        "serial": serial,
         "os_version": sys_descr or "",
+        "sys_contact": system.get("sys_contact", ""),
+        "sys_location": system.get("sys_location", ""),
+        "interfaces": tables["interfaces"],
+        "ip_addresses": tables["ip_addresses"],
+        "arp_table": tables["arp_table"],
+        "physical": tables["physical"],
+        "neighbors": tables["neighbors"],
+        "interfaces_found": len(tables["interfaces"]),
+        "ip_addresses_found": len(tables["ip_addresses"]),
+        "neighbors_found": len(tables["neighbors"]),
     }
+
+
+def get_interface_status(status_name="Active"):
+    """Return a Status object usable for dcim.Interface, falling back to the first."""
+    return Status.objects.get_for_model(Interface).filter(name=status_name).first() or Status.objects.get_for_model(
+        Interface
+    ).first()
+
+
+def get_ip_address_status():
+    """Return the default 'Active' Status for ipam.IPAddress."""
+    return Status.objects.get_for_model(IPAddress).filter(name="Active").first() or Status.objects.get_for_model(
+        IPAddress
+    ).first()
+
+
+def _interface_enabled(iface_row):
+    """Map SNMP admin/oper status to Nautobot Interface.enabled."""
+    oper_status = iface_row.get("oper_status")
+    if oper_status is not None:
+        return oper_status == OPER_STATUS_UP
+    admin_status = iface_row.get("admin_status")
+    if admin_status is not None:
+        return admin_status == OPER_STATUS_UP
+    return True
+
+
+def populate_device_from_snmp(device, info, config):
+    """Populate Device, Interface, and IPAddress objects from SNMP tables.
+
+    Creates dcim.Interface objects from the IF-MIB table and assigns
+    ipam.IPAddress objects (from IP-MIB) to the matching interfaces.
+    Operates idempotently: existing interfaces/IPs are matched by name/address.
+
+    Returns:
+        dict with counts: interfaces_created, ip_addresses_created
+    """
+    if not info or not device:
+        return {"interfaces_created": 0, "ip_addresses_created": 0}
+
+    counts = {"interfaces_created": 0, "ip_addresses_created": 0}
+    interfaces_data = info.get("interfaces") or []
+    ip_addresses_data = info.get("ip_addresses") or []
+
+    if not config.get("populate_interfaces", True):
+        interfaces_data = []
+    if not config.get("populate_ip_addresses", True):
+        ip_addresses_data = []
+
+    interface_by_index = {}
+    for iface_row in interfaces_data:
+        name = (iface_row.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            iface, created = Interface.objects.get_or_create(
+                device=device,
+                name=name,
+                defaults={
+                    "type": iface_row.get("type", "other"),
+                    "status": get_interface_status(
+                        "Active" if _interface_enabled(iface_row) else "Maintenance"
+                    ),
+                    "enabled": _interface_enabled(iface_row),
+                    "mac_address": iface_row.get("mac") or None,
+                    "mtu": iface_row.get("mtu"),
+                    "speed": iface_row.get("speed"),
+                    "description": (iface_row.get("alias") or "")[:200],
+                },
+            )
+            if created:
+                counts["interfaces_created"] += 1
+            else:
+                # Update mutable facts on existing interface
+                changed = False
+                if iface_row.get("mac"):
+                    iface.mac_address = iface_row["mac"]
+                    changed = True
+                if iface_row.get("speed"):
+                    iface.speed = iface_row["speed"]
+                    changed = True
+                if iface_row.get("alias"):
+                    iface.description = (iface_row["alias"])[:200]
+                    changed = True
+                if changed:
+                    iface.save(update_fields=["mac_address", "speed", "description"])
+            interface_by_index[str(iface_row.get("index"))] = iface
+        except Exception as exc:
+            logger.debug("Failed to create interface %s on %s: %s", name, device.name, exc)
+
+    active_ip_status = get_ip_address_status()
+    for ip_row in ip_addresses_data:
+        address = ip_row.get("address")
+        if not address:
+            continue
+        prefix = ip_row.get("prefix_length") or 32
+        ip_str = f"{address}/{prefix}"
+        try:
+            ip_obj, created = IPAddress.objects.get_or_create(
+                address=ip_str,
+                defaults={"status": active_ip_status},
+            )
+            if created:
+                counts["ip_addresses_created"] += 1
+            iface = interface_by_index.get(str(ip_row.get("if_index")))
+            if iface and not ip_obj.assigned_object_id:
+                ip_obj.assigned_object = iface
+                ip_obj.save()
+        except Exception as exc:
+            logger.debug("Failed to assign IP %s on %s: %s", ip_str, device.name, exc)
+
+    return counts
 
 
 class SNMPDiscoveryJob(Job):
@@ -462,9 +583,14 @@ class SNMPDiscoveryJob(Job):
         - sysName (hostname)
         - sysObjectID (platform identification)
         - sysDescr (vendor, model, OS)
+        - sysContact / sysLocation
+        - Interface table (IF-MIB), IP address table (IP-MIB)
+        - Physical inventory (ENTITY-MIB, for serial numbers)
+        - LLDP / CDP neighbors
 
-        Discovered devices are automatically created in Nautobot
-        with auto-generated Manufacturer, DeviceType, and Platform objects.
+        Discovered devices are automatically created in Nautobot with
+        auto-generated Manufacturer, DeviceType, and Platform objects.
+        Interfaces and IP addresses are populated from the walked tables.
         """
         dryrun_default = True
         has_sensitive_variables = False
@@ -489,12 +615,28 @@ class SNMPDiscoveryJob(Job):
         max_value=100,
         description="Number of concurrent SNMP probes.",
     )
+    populate_interfaces = BooleanVar(
+        default=True,
+        description="Create dcim.Interface objects from the IF-MIB table.",
+    )
+    populate_ip_addresses = BooleanVar(
+        default=True,
+        description="Create and assign ipam.IPAddress objects from the IP-MIB table.",
+    )
+    include_neighbors = BooleanVar(
+        default=True,
+        description="Walk LLDP and CDP neighbor tables (recorded, not linked).",
+    )
+    dryrun = DryRunVar()
 
-    def run(self, *, target_network, snmp_community, timeout, concurrency):
+    def run(self, *, target_network, snmp_community, timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, dryrun=False):
         config = get_plugin_config()
         config["snmp_community"] = snmp_community or config.get("snmp_community", "public")
         config["snmp_timeout"] = timeout
         config["snmp_retries"] = 2
+        config["populate_interfaces"] = populate_interfaces
+        config["populate_ip_addresses"] = populate_ip_addresses
+        config["include_neighbors"] = include_neighbors
 
         network = IPNetwork(target_network)
         scan_name = f"SNMP Scan: {network}"
@@ -526,17 +668,23 @@ class SNMPDiscoveryJob(Job):
                 with lock:
                     discovered += 1
 
-                device, result_status, error = create_device_in_nautobot(
-                    info["hostname"],
-                    ip_str,
-                    info["vendor"],
-                    info["model"],
-                    info["serial"],
-                    info["os_version"],
-                    info["platform_info"],
-                    config,
-                    discovery_scan,
-                )
+                if dryrun:
+                    device = None
+                    result_status = "new"
+                    error = "Dry-run: device discovered but not created"
+                else:
+                    device, result_status, error = create_device_in_nautobot(
+                        info["hostname"],
+                        ip_str,
+                        info["vendor"],
+                        info["model"],
+                        info["serial"],
+                        info["os_version"],
+                        info["platform_info"],
+                        config,
+                        discovery_scan,
+                        info,
+                    )
 
                 # Record result
                 DiscoveryResult.objects.create(
@@ -551,22 +699,36 @@ class SNMPDiscoveryJob(Job):
                     discovery_method="snmp",
                     result_status=result_status,
                     nautobot_device=device,
+                    sys_location=info.get("sys_location", ""),
+                    sys_contact=info.get("sys_contact", ""),
+                    interfaces_found=info.get("interfaces_found", 0),
+                    ip_addresses_found=info.get("ip_addresses_found", 0),
+                    neighbors_found=info.get("neighbors_found", 0),
+                    discovered_data={
+                        "interfaces": info.get("interfaces", []),
+                        "ip_addresses": info.get("ip_addresses", []),
+                        "arp_table": info.get("arp_table", []),
+                        "physical": info.get("physical", []),
+                        "neighbors": info.get("neighbors", []),
+                    },
                     error_message=error,
                 )
 
                 with lock:
                     if result_status == "new":
-                        created += 1
+                        if not dryrun:
+                            created += 1
                     elif result_status == "existing":
                         existing += 1
                     elif result_status == "failed":
                         failed += 1
 
                 self.logger.info(
-                    "SNMP: %s -> %s (%s)",
+                    "SNMP: %s -> %s (%s)%s",
                     ip_str,
                     info["hostname"],
                     result_status,
+                    " [dry-run]" if dryrun else "",
                 )
 
             except Exception as exc:
@@ -926,6 +1088,7 @@ class FullDiscoveryJob(Job):
 
         All discovered devices are automatically created in Nautobot
         with inferred Manufacturer, DeviceType, and Platform objects.
+        SNMP-discovered interfaces and IP addresses are also populated.
         """
         dryrun_default = True
         has_sensitive_variables = True
@@ -959,6 +1122,19 @@ class FullDiscoveryJob(Job):
         default=True,
         description="Run SSH discovery on hosts not identified by SNMP.",
     )
+    populate_interfaces = BooleanVar(
+        default=True,
+        description="Create dcim.Interface objects from the SNMP IF-MIB table.",
+    )
+    populate_ip_addresses = BooleanVar(
+        default=True,
+        description="Create and assign ipam.IPAddress objects from the SNMP IP-MIB table.",
+    )
+    include_neighbors = BooleanVar(
+        default=True,
+        description="Walk SNMP LLDP and CDP neighbor tables (recorded, not linked).",
+    )
+    dryrun = DryRunVar()
     timeout = IntegerVar(
         default=3,
         min_value=1,
@@ -973,8 +1149,12 @@ class FullDiscoveryJob(Job):
     )
 
     def run(self, *, target_network, snmp_community, ssh_username, ssh_password,
-            enable_ping, enable_snmp, enable_ssh, timeout, concurrency):
+            enable_ping, enable_snmp, enable_ssh, populate_interfaces=True, populate_ip_addresses=True,
+            include_neighbors=True, dryrun=False, timeout, concurrency):
         config = get_plugin_config()
+        config["populate_interfaces"] = populate_interfaces
+        config["populate_ip_addresses"] = populate_ip_addresses
+        config["include_neighbors"] = include_neighbors
         network = IPNetwork(target_network)
         scan_name = f"Full Scan: {network}"
 
@@ -1034,11 +1214,16 @@ class FullDiscoveryJob(Job):
                             snmp_results[ip_str] = info
                             total_discovered += 1
 
-                        device, result_status, error = create_device_in_nautobot(
-                            info["hostname"], ip_str, info["vendor"], info["model"],
-                            info["serial"], info["os_version"], info["platform_info"],
-                            config, discovery_scan,
-                        )
+                        if dryrun:
+                            device = None
+                            result_status = "new"
+                            error = "Dry-run: device discovered but not created"
+                        else:
+                            device, result_status, error = create_device_in_nautobot(
+                                info["hostname"], ip_str, info["vendor"], info["model"],
+                                info["serial"], info["os_version"], info["platform_info"],
+                                config, discovery_scan, info,
+                            )
 
                         DiscoveryResult.objects.create(
                             scan=discovery_scan,
@@ -1052,15 +1237,32 @@ class FullDiscoveryJob(Job):
                             discovery_method="snmp",
                             result_status=result_status,
                             nautobot_device=device,
+                            sys_location=info.get("sys_location", ""),
+                            sys_contact=info.get("sys_contact", ""),
+                            interfaces_found=info.get("interfaces_found", 0),
+                            ip_addresses_found=info.get("ip_addresses_found", 0),
+                            neighbors_found=info.get("neighbors_found", 0),
+                            discovered_data={
+                                "interfaces": info.get("interfaces", []),
+                                "ip_addresses": info.get("ip_addresses", []),
+                                "arp_table": info.get("arp_table", []),
+                                "physical": info.get("physical", []),
+                                "neighbors": info.get("neighbors", []),
+                            },
                             error_message=error,
                         )
 
                         if result_status == "new":
-                            total_created += 1
+                            if not dryrun:
+                                total_created += 1
                         elif result_status == "existing":
                             total_existing += 1
 
-                        self.logger.info("SNMP: %s -> %s (%s)", ip_str, info["hostname"], result_status)
+                        self.logger.info(
+                            "SNMP: %s -> %s (%s)%s",
+                            ip_str, info["hostname"], result_status,
+                            " [dry-run]" if dryrun else "",
+                        )
 
                 except Exception as exc:
                     total_failed += 1
@@ -1089,11 +1291,16 @@ class FullDiscoveryJob(Job):
                     with lock:
                         total_discovered += 1
 
-                    device, result_status, error = create_device_in_nautobot(
-                        info["hostname"], ip_str, info["vendor"], info["model"],
-                        info["serial"], info["os_version"], None,
-                        config, discovery_scan,
-                    )
+                    if dryrun:
+                        device = None
+                        result_status = "new"
+                        error = "Dry-run: device discovered but not created"
+                    else:
+                        device, result_status, error = create_device_in_nautobot(
+                            info["hostname"], ip_str, info["vendor"], info["model"],
+                            info["serial"], info["os_version"], None,
+                            config, discovery_scan,
+                        )
 
                     DiscoveryResult.objects.create(
                         scan=discovery_scan,
@@ -1112,13 +1319,18 @@ class FullDiscoveryJob(Job):
 
                     with lock:
                         if result_status == "new":
-                            total_created += 1
+                            if not dryrun:
+                                total_created += 1
                         elif result_status == "existing":
                             total_existing += 1
                         else:
                             total_failed += 1
 
-                    self.logger.info("SSH: %s -> %s (%s)", ip_str, info["hostname"], result_status)
+                    self.logger.info(
+                        "SSH: %s -> %s (%s)%s",
+                        ip_str, info["hostname"], result_status,
+                        " [dry-run]" if dryrun else "",
+                    )
 
                 except Exception as exc:
                     with lock:

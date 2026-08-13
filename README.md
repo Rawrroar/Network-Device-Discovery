@@ -18,14 +18,26 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - Tracks discovery history via `DiscoveryScan` and `DiscoveryResult` models
 - Configurable defaults for device location, role, status, and tags
 - Threaded/concurrent scanning for fast results
-- Dry-run mode for SNMP and SSH jobs
+- Dry-run mode for SNMP, SSH, and Full jobs
 - Compatible with Nautobot v3.x
+
+### SNMP table collection
+
+When a device responds to SNMP, the plugin walks common MIB tables and populates Nautobot:
+
+- **System scalars** — `sysName`, `sysDescr`, `sysObjectID`, `sysContact`, `sysLocation`
+- **Interfaces (IF-MIB)** — creates `dcim.Interface` objects with name, type, MAC, MTU, speed, admin/oper status (as `Active`/`Maintenance` status and `enabled`), and `ifAlias` as the description
+- **IP addresses (IP-MIB)** — creates `ipam.IPAddress` objects and assigns them to the matching interface
+- **Physical inventory (ENTITY-MIB)** — used to populate the Device `serial` number
+- **Neighbors (LLDP-MIB / CISCO-CDP-MIB)** — recorded on the `DiscoveryResult` (`neighbors_found`, `discovered_data`), not linked as Cables
+
+Raw walked tables are stored in `DiscoveryResult.discovered_data` so you can review exactly what was found, including in dry-run mode.
 
 ## Requirements
 
 - Nautobot >= 3.0, < 4.0
 - Python >= 3.9
-- `pysnmp-leiden` for SNMP queries
+- `pysnmp>=4.4` for SNMP queries
 - `paramiko` for SSH connections
 
 ## Installation
@@ -63,6 +75,10 @@ PLUGINS_CONFIG = {
         "snmp_timeout": 3,
         "snmp_retries": 2,
         "snmp_community": "public",
+        "populate_interfaces": True,
+        "populate_ip_addresses": True,
+        "include_neighbors": True,
+        "max_walk_oids": 1000,
         "ssh_timeout": 10,
         "ssh_banner_timeout": 30,
         "ping_timeout": 2,
@@ -95,9 +111,10 @@ Discovers devices via SNMP:
 1. Navigate to **Jobs > SNMP Discovery**
 2. Enter target network
 3. Provide SNMP community string
-4. Run the job
+4. Optionally toggle **Populate interfaces**, **Populate IP addresses**, and **Include neighbors**
+5. Run the job
 
-Devices discovered via SNMP are auto-created in Nautobot. Platform identification is done via SNMP OID matching.
+Devices discovered via SNMP are auto-created in Nautobot. Platform identification is done via SNMP OID matching. Interfaces and IP addresses are created from the walked IF-MIB and IP-MIB tables; the Device serial number comes from ENTITY-MIB when available. In dry-run mode, no objects are created but all walked table data is captured on the `DiscoveryResult` for review.
 
 ### SSH Discovery
 
@@ -169,6 +186,10 @@ For SSH-discovered devices, vendor detection is done via keyword matching on com
 | `snmp_timeout` | `3` | SNMP query timeout in seconds |
 | `snmp_retries` | `2` | SNMP retry count |
 | `snmp_community` | `"public"` | Default SNMP community string |
+| `populate_interfaces` | `True` | Create `dcim.Interface` objects from IF-MIB |
+| `populate_ip_addresses` | `True` | Create/assign `ipam.IPAddress` objects from IP-MIB |
+| `include_neighbors` | `True` | Walk LLDP/CDP neighbor tables |
+| `max_walk_oids` | `1000` | Cap on rows walked per MIB table |
 | `ssh_timeout` | `10` | SSH connection timeout in seconds |
 | `ssh_banner_timeout` | `30` | SSH banner wait timeout in seconds |
 | `ping_timeout` | `2` | ICMP ping timeout in seconds |

@@ -16,6 +16,10 @@ DEFAULT_PLUGINS_CONFIG = {
     "ssh_banner_timeout": 30,
     "ping_timeout": 2,
     "concurrency": 10,
+    "populate_interfaces": True,
+    "populate_ip_addresses": True,
+    "include_neighbors": True,
+    "max_walk_oids": 1000,
 }
 
 

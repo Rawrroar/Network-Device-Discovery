@@ -4,11 +4,13 @@ from unittest.mock import patch, MagicMock
 
 from django.test import TestCase, TransactionTestCase
 from nautobot.extras.test_tools import run_job_for_testing
-from nautobot.dcim.models import Device, DeviceType, Location, LocationType, Manufacturer, Platform
+from nautobot.dcim.models import Device, DeviceType, Interface, Location, LocationType, Manufacturer, Platform
 from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
+from nautobot.ipam.models import IPAddress
 
 from nautobot_plugin_device_auto_discovery.mappings import lookup_platform_from_oid
+from nautobot_plugin_device_auto_discovery.models import DiscoveryResult
 from nautobot_plugin_device_auto_discovery.jobs import (
     PingSweepJob,
     SNMPDiscoveryJob,
@@ -284,6 +286,183 @@ class SNMPDiscoveryJobTests(TestCase):
             )
             self.assertEqual(result["discovered"], 0)
             self.assertEqual(result["created"], 0)
+
+    @staticmethod
+    def _table_aware_snmp_discover(ip_str, config):
+        if ip_str == "10.0.0.1":
+            return {
+                "hostname": "switch-001",
+                "sys_descr": "Cisco Catalyst 9300, IOS-XE 17.3",
+                "sys_object_id": "1.3.6.1.4.1.9.1.675.1.2.3",
+                "platform_info": {
+                    "platform_name": "Cisco IOS-XE",
+                    "manufacturer_name": "Cisco",
+                    "network_driver": "ios",
+                },
+                "vendor": "Cisco",
+                "model": "Catalyst 9300",
+                "serial": "FCW2134ABCD",
+                "os_version": "IOS-XE 17.3",
+                "sys_contact": "noc@example.com",
+                "sys_location": "DC1 Row 3",
+                "interfaces": [
+                    {
+                        "index": "1",
+                        "name": "GigabitEthernet0/0/1",
+                        "descr": "GigabitEthernet0/0/1",
+                        "type": "ethernet-csmacd",
+                        "mtu": 1500,
+                        "speed": 1000000,
+                        "mac": "00:11:22:33:44:55",
+                        "admin_status": 1,
+                        "oper_status": 1,
+                        "alias": "Uplink",
+                    },
+                    {
+                        "index": "2",
+                        "name": "Loopback0",
+                        "descr": "Loopback0",
+                        "type": "softwareLoopback",
+                        "mtu": 1514,
+                        "speed": None,
+                        "mac": "",
+                        "admin_status": 1,
+                        "oper_status": 1,
+                        "alias": "",
+                    },
+                ],
+                "ip_addresses": [
+                    {"address": "10.0.0.1", "prefix_length": 24, "if_index": "1"},
+                ],
+                "arp_table": [{"if_index": "1", "ip": "10.0.0.2", "mac": "aa:bb:cc:dd:ee:01"}],
+                "physical": [{"class": 3, "descr": "Chassis", "serial": "FCW2134ABCD"}],
+                "neighbors": [
+                    {
+                        "protocol": "lldp",
+                        "local_if_index": "1",
+                        "local_port_num": "1",
+                        "remote_name": "spine-001",
+                        "remote_port": "GigabitEthernet0/1",
+                        "remote_description": "Cisco IOS-XE",
+                        "remote_ip": "",
+                        "remote_chassis_id": "00:11:22:33:44:55",
+                    },
+                ],
+                "interfaces_found": 2,
+                "ip_addresses_found": 1,
+                "neighbors_found": 1,
+            }
+        return None
+
+    def test_snmp_discovery_populates_interfaces_and_ips(self):
+        with patch(
+            "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
+            side_effect=self._table_aware_snmp_discover,
+        ):
+            result = run_job_for_testing(
+                SNMPDiscoveryJob,
+                data={
+                    "target_network": "10.0.0.0/30",
+                    "snmp_community": "public",
+                    "timeout": 1,
+                    "concurrency": 5,
+                },
+            )
+            self.assertEqual(result["discovered"], 1)
+            self.assertEqual(result["created"], 1)
+
+        device = Device.objects.get(name="switch-001")
+        self.assertEqual(str(device.serial), "FCW2134ABCD")
+
+        iface = Interface.objects.get(device=device, name="GigabitEthernet0/0/1")
+        self.assertEqual(iface.type, "ethernet-csmacd")
+        self.assertEqual(iface.mac_address, "00:11:22:33:44:55")
+        self.assertEqual(iface.speed, 1000000)
+        self.assertEqual(iface.description, "Uplink")
+        self.assertTrue(iface.enabled)
+
+        self.assertTrue(Interface.objects.filter(device=device, name="Loopback0", type="softwareLoopback").exists())
+
+        ip_obj = IPAddress.objects.get(address="10.0.0.1/24")
+        self.assertEqual(ip_obj.assigned_object, iface)
+
+        discovery_result = DiscoveryResult.objects.get(ip_address="10.0.0.1")
+        self.assertEqual(discovery_result.interfaces_found, 2)
+        self.assertEqual(discovery_result.ip_addresses_found, 1)
+        self.assertEqual(discovery_result.neighbors_found, 1)
+        self.assertEqual(discovery_result.sys_location, "DC1 Row 3")
+        self.assertEqual(discovery_result.sys_contact, "noc@example.com")
+        self.assertIn("interfaces", discovery_result.discovered_data)
+        self.assertEqual(len(discovery_result.discovered_data["neighbors"]), 1)
+
+    def test_snmp_discovery_idempotent_on_existing_device(self):
+        for _ in range(2):
+            with patch(
+                "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
+                side_effect=self._table_aware_snmp_discover,
+            ):
+                result = run_job_for_testing(
+                    SNMPDiscoveryJob,
+                    data={
+                        "target_network": "10.0.0.0/30",
+                        "snmp_community": "public",
+                        "timeout": 1,
+                        "concurrency": 5,
+                    },
+                )
+                self.assertEqual(result["discovered"], 1)
+
+        device = Device.objects.get(name="switch-001")
+        self.assertEqual(device.interfaces.count(), 2)
+        self.assertEqual(IPAddress.objects.filter(address="10.0.0.1/24").count(), 1)
+
+    def test_snmp_discovery_dry_run_creates_nothing(self):
+        with patch(
+            "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
+            side_effect=self._table_aware_snmp_discover,
+        ):
+            result = run_job_for_testing(
+                SNMPDiscoveryJob,
+                data={
+                    "target_network": "10.0.0.0/30",
+                    "snmp_community": "public",
+                    "timeout": 1,
+                    "concurrency": 5,
+                    "dryrun": True,
+                },
+            )
+            self.assertEqual(result["discovered"], 1)
+            self.assertEqual(result["created"], 0)
+
+        self.assertFalse(Device.objects.filter(name="switch-001").exists())
+        self.assertFalse(IPAddress.objects.filter(address="10.0.0.1/24").exists())
+
+        discovery_result = DiscoveryResult.objects.get(ip_address="10.0.0.1")
+        self.assertIn("interfaces", discovery_result.discovered_data)
+        self.assertIsNone(discovery_result.nautobot_device)
+        self.assertIn("Dry-run", discovery_result.error_message)
+
+    def test_snmp_discovery_populate_toggle_off(self):
+        with patch(
+            "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
+            side_effect=self._table_aware_snmp_discover,
+        ):
+            result = run_job_for_testing(
+                SNMPDiscoveryJob,
+                data={
+                    "target_network": "10.0.0.0/30",
+                    "snmp_community": "public",
+                    "timeout": 1,
+                    "concurrency": 5,
+                    "populate_interfaces": False,
+                    "populate_ip_addresses": False,
+                },
+            )
+            self.assertEqual(result["created"], 1)
+
+        device = Device.objects.get(name="switch-001")
+        self.assertEqual(device.interfaces.count(), 0)
+        self.assertFalse(IPAddress.objects.filter(address="10.0.0.1/24").exists())
 
 
 class SSHDiscoveryJobTests(TestCase):

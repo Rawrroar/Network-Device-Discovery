@@ -1,5 +1,7 @@
 """Django models for the Device Auto-Discovery plugin."""
 
+import django.core.serializers.json
+
 from django.db import models
 from nautobot.apps.models import PrimaryModel
 
@@ -134,6 +136,36 @@ class DiscoveryResult(PrimaryModel):
         blank=True,
         related_name="discovery_results",
         help_text="The Nautobot Device object, if created or matched.",
+    )
+    sys_location = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text="SNMP sysLocation value.",
+    )
+    sys_contact = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text="SNMP sysContact value.",
+    )
+    interfaces_found = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of interfaces discovered via SNMP.",
+    )
+    ip_addresses_found = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of IP addresses discovered via SNMP.",
+    )
+    neighbors_found = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of LLDP/CDP neighbors discovered via SNMP.",
+    )
+    discovered_data = models.JSONField(
+        encoder=django.core.serializers.json.DjangoJSONEncoder,
+        blank=True,
+        default=dict,
+        help_text="Raw MIB table data captured during SNMP discovery.",
     )
     error_message = models.TextField(
         blank=True,

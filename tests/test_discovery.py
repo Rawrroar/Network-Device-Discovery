@@ -8,7 +8,7 @@ from nautobot.extras.test_tools import run_job_for_testing
 from nautobot.dcim.models import Device, DeviceType, Interface, Location, LocationType, Manufacturer, Platform
 from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
-from nautobot.ipam.models import IPAddress
+from nautobot.ipam.models import IPAddress, Prefix
 
 from nautobot_plugin_device_auto_discovery.mappings import lookup_platform_from_oid
 from nautobot_plugin_device_auto_discovery.models import DiscoveryResult
@@ -19,6 +19,8 @@ from nautobot_plugin_device_auto_discovery.jobs import (
     FullDiscoveryJob,
     safe_icmp_ping,
     create_device_in_nautobot,
+    ensure_parent_prefix,
+    network_prefix_for,
     get_or_create_manufacturer,
     get_or_create_platform,
     get_or_create_device_type,
@@ -251,6 +253,90 @@ class HelperFunctionTests(TestCase):
         )
         self.assertEqual(status, "existing")
         Device.objects.filter(name="existing-device").delete()
+
+    def test_device_creation_sets_primary_ip_and_parent_prefix(self):
+        config = {
+            "default_location": "Test Location",
+            "default_role": "Test Role",
+            "default_status": "Active",
+            "default_tags": [],
+            "create_missing_objects": True,
+        }
+        platform_info = {
+            "platform_name": "Cisco IOS-XE",
+            "manufacturer_name": "Cisco",
+            "network_driver": "ios",
+        }
+        device, status, error = create_device_in_nautobot(
+            "ip-device-001",
+            "192.168.1.10",
+            "Cisco",
+            "Catalyst 9300",
+            "",
+            "17.3.4",
+            platform_info,
+            config,
+            None,
+        )
+        self.assertIsNotNone(device)
+        self.assertEqual(status, "new")
+        # Nautobot 3.x requires a parent Prefix before an IPAddress can exist.
+        self.assertIsNotNone(device.primary_ip4)
+        self.assertEqual(str(device.primary_ip4.address), "192.168.1.10/32")
+        self.assertTrue(Prefix.objects.filter(prefix="192.168.1.10/32").exists())
+        Device.objects.filter(name="ip-device-001").delete()
+
+    def test_ensure_parent_prefix_is_idempotent(self):
+        first = ensure_parent_prefix("192.168.2.5", 24)
+        second = ensure_parent_prefix("192.168.2.9", 24)
+        self.assertIsNotNone(first)
+        self.assertEqual(str(first.prefix), "192.168.2.0/24")
+        self.assertEqual(first.pk, second.pk)
+
+    def test_network_prefix_for(self):
+        self.assertEqual(network_prefix_for("192.168.2.5", 24), "192.168.2.0/24")
+        self.assertEqual(network_prefix_for("192.168.1.47", 32), "192.168.1.47/32")
+        self.assertEqual(network_prefix_for("2001:db8::1", 64), "2001:db8::/64")
+        self.assertIsNone(network_prefix_for("not-an-ip", 24))
+        self.assertIsNone(network_prefix_for("", 24))
+
+    def test_device_creation_fills_missing_serial_on_existing(self):
+        config = {
+            "default_location": "Test Location",
+            "default_role": "Test Role",
+            "default_status": "Active",
+            "default_tags": [],
+            "create_missing_objects": True,
+        }
+        mfr = Manufacturer.objects.create(name="Cisco")
+        dt = DeviceType.objects.create(model="No Serial Model", manufacturer=mfr)
+        device = Device.objects.create(
+            name="no-serial-device",
+            device_type=dt,
+            role=self.device_role,
+            location=self.location,
+            status=self.device_status,
+            serial="",
+        )
+        platform_info = {
+            "platform_name": "Cisco IOS",
+            "manufacturer_name": "Cisco",
+            "network_driver": "ios",
+        }
+        updated, status, error = create_device_in_nautobot(
+            "no-serial-device",
+            "192.168.1.20",
+            "Cisco",
+            "No Serial Model",
+            "FTJ987654AB",
+            "15.2",
+            platform_info,
+            config,
+            None,
+        )
+        self.assertEqual(status, "existing")
+        self.assertEqual(str(updated.serial), "FTJ987654AB")
+        Device.objects.filter(name="no-serial-device").delete()
 
 
 class PingSweepJobTests(TestCase):

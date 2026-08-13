@@ -36,7 +36,7 @@ from nautobot.dcim.models import (
 )
 from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
-from nautobot.ipam.models import IPAddress
+from nautobot.ipam.models import IPAddress, Namespace, Prefix
 
 from .models import DiscoveryScan, DiscoveryResult
 from .mappings import lookup_platform_from_oid
@@ -275,6 +275,10 @@ def resolve_nautobot_objects(hostname, ip_str, vendor, model, serial, os_version
             existing_device.platform = platform
             needs_device_save = True
 
+        if serial and not existing_device.serial:
+            existing_device.serial = serial
+            needs_device_save = True
+
         if needs_device_save:
             existing_device.save()
 
@@ -362,6 +366,10 @@ def create_device_in_nautobot(
         # Assign primary IP (fallback) if not already set by SNMP table population
         if ip_str and not device.primary_ip4:
             try:
+                # Nautobot 3.x: IPAddress must have a containing Prefix in its
+                # Namespace, otherwise creation fails silently (0 IPs registered).
+                # Host routes (/32) are used for the fallback scan address.
+                ensure_parent_prefix(ip_str, 32)
                 ip_obj, _ = IPAddress.objects.get_or_create(
                     address=ip_str + "/32",
                     defaults={
@@ -595,6 +603,66 @@ def get_ip_address_status():
     ).first()
 
 
+def get_default_namespace():
+    """Return the default 'Global' IPAM Namespace, creating it if needed.
+
+    Nautobot 2.x/3.x requires IP addresses and prefixes to belong to a
+    Namespace; the standard default is named "Global".
+    """
+    namespace, _ = Namespace.objects.get_or_create(
+        name="Global",
+        defaults={"description": "Default Global namespace. Created by Nautobot."},
+    )
+    return namespace
+
+
+def get_prefix_status():
+    """Return the default 'Active' Status for ipam.Prefix."""
+    return Status.objects.get_for_model(Prefix).filter(name="Active").first() or Status.objects.get_for_model(
+        Prefix
+    ).first()
+
+
+def network_prefix_for(address, prefix_length):
+    """Compute the network CIDR containing ``address/prefix_length``.
+
+    Returns a string like ``"10.0.0.0/24"`` (or the host-route network for
+    host masks, e.g. ``"192.168.1.47/32"``), or None for an invalid input.
+    """
+    try:
+        network = IPNetwork(f"{address}/{prefix_length}")
+        return str(network)
+    except Exception:
+        return None
+
+
+def ensure_parent_prefix(address, prefix_length, namespace=None):
+    """Find-or-create a Network Prefix able to parent an IP address.
+
+    Nautobot 3.x requires every IPAddress to have a containing Prefix in its
+    Namespace (enforced in ``IPAddress.clean()`` and ``get_or_create()``).
+    This computes the network for ``address/prefix_length`` and ensures that
+    Prefix exists so IPAddress creation cannot fail. Host masks (/32, /128)
+    are registered as host-route prefixes.
+
+    Returns:
+        Prefix object, or None on failure.
+    """
+    prefix_cidr = network_prefix_for(address, prefix_length)
+    if not prefix_cidr:
+        return None
+    try:
+        prefix, _ = Prefix.objects.get_or_create(
+            prefix=prefix_cidr,
+            namespace=namespace or get_default_namespace(),
+            defaults={"status": get_prefix_status()},
+        )
+        return prefix
+    except Exception as exc:
+        logger.debug("Failed to ensure parent prefix %s: %s", prefix_cidr, exc)
+        return None
+
+
 def _interface_enabled(iface_row):
     """Map SNMP admin/oper status to Nautobot Interface.enabled."""
     oper_status = iface_row.get("oper_status")
@@ -681,6 +749,9 @@ def populate_device_from_snmp(device, info, config, ip_str=None):
         prefix = ip_row.get("prefix_length") or 32
         ip_str_full = f"{address}/{prefix}"
         try:
+            # Nautobot 3.x: IPAddress must have a containing Prefix in its
+            # Namespace, otherwise creation fails silently (0 IPs registered).
+            ensure_parent_prefix(address, prefix)
             ip_obj, created = IPAddress.objects.get_or_create(
                 address=ip_str_full,
                 defaults={"status": active_ip_status},

@@ -24,7 +24,7 @@ LEGACY_TO_VALID = {
 def _valid_interface_types():
     from nautobot.dcim.choices import InterfaceTypeChoices
 
-    return {value for _, value in InterfaceTypeChoices.choices()}
+    return set(InterfaceTypeChoices.values())
 
 
 def fix_interface_types(apps, schema_editor):

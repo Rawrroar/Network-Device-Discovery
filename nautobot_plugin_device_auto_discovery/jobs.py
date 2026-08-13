@@ -37,7 +37,7 @@ from nautobot.dcim.models import (
 )
 from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
-from nautobot.ipam.models import IPAddress, Namespace, Prefix
+from nautobot.ipam.models import IPAddress, Namespace, Prefix, VLAN, VLANGroup
 
 from .models import DiscoveryScan, DiscoveryResult
 from .mappings import lookup_platform_from_oid
@@ -547,8 +547,8 @@ def snmp_discover_device(ip_str, config):
     Returns:
         dict with hostname, sysdescr, sysobjectid, platform_info, vendor,
         model, serial, os_version, sys_contact, sys_location, interfaces,
-        ip_addresses, arp_table, physical, neighbors and table counts,
-        or None if the host is not SNMP-reachable.
+        ip_addresses, arp_table, physical, neighbors, vlans and table
+        counts, or None if the host is not SNMP-reachable.
     """
     tables = discover_snmp_tables(ip_str, config)
     system = tables["system"]
@@ -607,9 +607,11 @@ def snmp_discover_device(ip_str, config):
         "arp_table": tables["arp_table"],
         "physical": tables["physical"],
         "neighbors": tables["neighbors"],
+        "vlans": tables["vlans"],
         "interfaces_found": len(tables["interfaces"]),
         "ip_addresses_found": len(tables["ip_addresses"]),
         "neighbors_found": len(tables["neighbors"]),
+        "vlans_found": len(tables["vlans"]),
     }
 
 
@@ -624,6 +626,13 @@ def get_ip_address_status():
     """Return the default 'Active' Status for ipam.IPAddress."""
     return Status.objects.get_for_model(IPAddress).filter(name="Active").first() or Status.objects.get_for_model(
         IPAddress
+    ).first()
+
+
+def get_vlan_status():
+    """Return the default 'Active' Status for ipam.VLAN."""
+    return Status.objects.get_for_model(VLAN).filter(name="Active").first() or Status.objects.get_for_model(
+        VLAN
     ).first()
 
 
@@ -698,23 +707,68 @@ def _interface_enabled(iface_row):
     return True
 
 
+def populate_vlans_from_snmp(device, vlans_data, config):
+    """Create ipam.VLAN objects from the Q-BRIDGE-MIB table.
+
+    VLANs discovered on a device are grouped under a per-device
+    ``VLANGroup`` so that IDs and names stay unique per group and the
+    resulting objects remain idempotent across rescans.
+
+    Returns:
+        int number of VLANs created.
+    """
+    if not device or not vlans_data:
+        return 0
+    if not config.get("populate_vlans", True):
+        return 0
+
+    group, _ = VLANGroup.objects.get_or_create(
+        name=f"{device.name} VLANs",
+        defaults={"description": f"VLANs auto-discovered on {device.name}."},
+    )
+    status = get_vlan_status()
+    created = 0
+
+    for row in vlans_data:
+        vid = row.get("vid")
+        if not vid:
+            continue
+        name = (row.get("name") or f"VLAN {vid}").strip()
+        try:
+            vlan, was_created = VLAN.objects.get_or_create(
+                vlan_group=group,
+                vid=vid,
+                defaults={"name": name, "status": status},
+            )
+            if was_created:
+                created += 1
+            elif name and vlan.name != name:
+                vlan.name = name
+                vlan.save(update_fields=["name"])
+        except Exception as exc:
+            logger.debug("Failed to create VLAN %s on %s: %s", vid, device.name, exc)
+
+    return created
+
+
 def populate_device_from_snmp(device, info, config, ip_str=None):
     """Populate Device, Interface, and IPAddress objects from SNMP tables.
 
-    Creates dcim.Interface objects from the IF-MIB table and assigns
-    ipam.IPAddress objects (from IP-MIB) to the matching interfaces.
+    Creates dcim.Interface objects from the IF-MIB table, assigns
+    ipam.IPAddress objects (from IP-MIB) to the matching interfaces, and
+    creates ipam.VLAN objects (from Q-BRIDGE-MIB).
     Operates idempotently: existing interfaces/IPs are matched by name/address.
 
     If ``ip_str`` matches one of the discovered addresses, that IP is set as
     the Device primary IP (using the discovered prefix length).
 
     Returns:
-        dict with counts: interfaces_created, ip_addresses_created
+        dict with counts: interfaces_created, ip_addresses_created, vlans_created
     """
     if not info or not device:
-        return {"interfaces_created": 0, "ip_addresses_created": 0}
+        return {"interfaces_created": 0, "ip_addresses_created": 0, "vlans_created": 0}
 
-    counts = {"interfaces_created": 0, "ip_addresses_created": 0}
+    counts = {"interfaces_created": 0, "ip_addresses_created": 0, "vlans_created": 0}
     interfaces_data = info.get("interfaces") or []
     ip_addresses_data = info.get("ip_addresses") or []
 
@@ -795,6 +849,8 @@ def populate_device_from_snmp(device, info, config, ip_str=None):
         device.primary_ip4 = primary_ip_obj
         device.save(update_fields=["primary_ip4"])
 
+    counts["vlans_created"] = populate_vlans_from_snmp(device, info.get("vlans") or [], config)
+
     return counts
 
 
@@ -816,12 +872,13 @@ class SNMPDiscoveryJob(Job):
         - sysDescr (vendor, model, OS)
         - sysContact / sysLocation
         - Interface table (IF-MIB), IP address table (IP-MIB)
+        - VLAN table (Q-BRIDGE-MIB dot1qVlanStaticTable)
         - Physical inventory (ENTITY-MIB, for serial numbers)
         - LLDP / CDP neighbors
 
         Discovered devices are automatically created in Nautobot with
         auto-generated Manufacturer, DeviceType, and Platform objects.
-        Interfaces and IP addresses are populated from the walked tables.
+        Interfaces, IP addresses, and VLANs are populated from the walked tables.
         """
         dryrun_default = True
         has_sensitive_variables = False
@@ -858,9 +915,17 @@ class SNMPDiscoveryJob(Job):
         default=True,
         description="Walk LLDP and CDP neighbor tables (recorded, not linked).",
     )
+    include_vlans = BooleanVar(
+        default=True,
+        description="Walk the Q-BRIDGE-MIB VLAN table.",
+    )
+    populate_vlans = BooleanVar(
+        default=True,
+        description="Create ipam.VLAN objects from the Q-BRIDGE-MIB table.",
+    )
     dryrun = DryRunVar()
 
-    def run(self, *, target_network, snmp_community, timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, dryrun=False):
+    def run(self, *, target_network, snmp_community, timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, include_vlans=True, populate_vlans=True, dryrun=False):
         config = get_plugin_config()
         config["snmp_community"] = snmp_community or config.get("snmp_community", "public")
         config["snmp_timeout"] = timeout
@@ -868,6 +933,8 @@ class SNMPDiscoveryJob(Job):
         config["populate_interfaces"] = populate_interfaces
         config["populate_ip_addresses"] = populate_ip_addresses
         config["include_neighbors"] = include_neighbors
+        config["include_vlans"] = include_vlans
+        config["populate_vlans"] = populate_vlans
 
         network = IPNetwork(target_network)
         scan_name = f"SNMP Scan: {network}"
@@ -935,12 +1002,14 @@ class SNMPDiscoveryJob(Job):
                     interfaces_found=info.get("interfaces_found", 0),
                     ip_addresses_found=info.get("ip_addresses_found", 0),
                     neighbors_found=info.get("neighbors_found", 0),
+                    vlans_found=info.get("vlans_found", 0),
                     discovered_data={
                         "interfaces": info.get("interfaces", []),
                         "ip_addresses": info.get("ip_addresses", []),
                         "arp_table": info.get("arp_table", []),
                         "physical": info.get("physical", []),
                         "neighbors": info.get("neighbors", []),
+                        "vlans": info.get("vlans", []),
                     },
                     error_message=error,
                 )
@@ -1469,7 +1538,7 @@ class FullDiscoveryJob(Job):
 
         All discovered devices are automatically created in Nautobot
         with inferred Manufacturer, DeviceType, and Platform objects.
-        SNMP-discovered interfaces and IP addresses are also populated.
+        SNMP-discovered interfaces, IP addresses, and VLANs are also populated.
         """
         dryrun_default = True
         has_sensitive_variables = True
@@ -1515,6 +1584,14 @@ class FullDiscoveryJob(Job):
         default=True,
         description="Walk SNMP LLDP and CDP neighbor tables (recorded, not linked).",
     )
+    include_vlans = BooleanVar(
+        default=True,
+        description="Walk the SNMP Q-BRIDGE-MIB VLAN table.",
+    )
+    populate_vlans = BooleanVar(
+        default=True,
+        description="Create ipam.VLAN objects from the SNMP Q-BRIDGE-MIB table.",
+    )
     dryrun = DryRunVar()
     timeout = IntegerVar(
         default=3,
@@ -1531,11 +1608,13 @@ class FullDiscoveryJob(Job):
 
     def run(self, *, target_network, snmp_community, ssh_username, ssh_password,
             enable_ping, enable_snmp, enable_ssh, populate_interfaces=True, populate_ip_addresses=True,
-            include_neighbors=True, dryrun=False, timeout, concurrency):
+            include_neighbors=True, include_vlans=True, populate_vlans=True, dryrun=False, timeout, concurrency):
         config = get_plugin_config()
         config["populate_interfaces"] = populate_interfaces
         config["populate_ip_addresses"] = populate_ip_addresses
         config["include_neighbors"] = include_neighbors
+        config["include_vlans"] = include_vlans
+        config["populate_vlans"] = populate_vlans
         ssh_username = ssh_username or config.get("ssh_username", "admin")
         ssh_password = ssh_password or config.get("ssh_password", "")
         ssh_port = config.get("ssh_port", 22)
@@ -1626,12 +1705,14 @@ class FullDiscoveryJob(Job):
                             interfaces_found=info.get("interfaces_found", 0),
                             ip_addresses_found=info.get("ip_addresses_found", 0),
                             neighbors_found=info.get("neighbors_found", 0),
+                            vlans_found=info.get("vlans_found", 0),
                             discovered_data={
                                 "interfaces": info.get("interfaces", []),
                                 "ip_addresses": info.get("ip_addresses", []),
                                 "arp_table": info.get("arp_table", []),
                                 "physical": info.get("physical", []),
                                 "neighbors": info.get("neighbors", []),
+                                "vlans": info.get("vlans", []),
                             },
                             error_message=error,
                         )

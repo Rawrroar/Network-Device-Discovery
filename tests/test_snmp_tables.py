@@ -13,6 +13,7 @@ from nautobot_plugin_device_auto_discovery.snmp_tables import (
     collect_lldp_neighbors,
     collect_physical,
     collect_system,
+    collect_vlans,
     discover_snmp_tables,
     find_chassis_model,
     find_chassis_serial,
@@ -293,6 +294,56 @@ class CollectNeighborsTests(TestCase):
         self.assertEqual(first["remote_description"], "Cisco Catalyst 9300")
 
 
+class CollectVlansTests(TestCase):
+    def test_dot1q_vlan_static_table(self):
+        columns = _column_map(
+            (snmp_tables.OID_VLANSTATICNAME, {"1": "default", "10": "Management", "20": "Users"}),
+            (snmp_tables.OID_VLANSTATICROWSTATUS, {"1": "1", "10": "1", "20": "1"}),
+        )
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.walk_columns",
+            side_effect=lambda ip_str, oid, *a, **k: columns.get(oid, {}),
+        ):
+            vlans = collect_vlans("192.0.2.1", CONFIG)
+
+        self.assertEqual(len(vlans), 3)
+        self.assertEqual(vlans[0]["vid"], 1)
+        self.assertEqual(vlans[0]["name"], "default")
+        self.assertEqual(vlans[1]["vid"], 10)
+        self.assertEqual(vlans[1]["name"], "Management")
+        self.assertEqual(vlans[1]["row_status"], 1)
+
+    def test_empty_table_returns_empty(self):
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.walk_columns",
+            return_value={},
+        ):
+            self.assertEqual(collect_vlans("192.0.2.1", CONFIG), [])
+
+    def test_sorted_by_vid(self):
+        columns = _column_map(
+            (snmp_tables.OID_VLANSTATICNAME, {"100": "v100", "2": "v2", "50": "v50"}),
+        )
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.walk_columns",
+            side_effect=lambda ip_str, oid, *a, **k: columns.get(oid, {}),
+        ):
+            vlans = collect_vlans("192.0.2.1", CONFIG)
+        self.assertEqual([v["vid"] for v in vlans], [2, 50, 100])
+
+    def test_invalid_vid_skipped(self):
+        columns = _column_map(
+            (snmp_tables.OID_VLANSTATICNAME, {"1": "ok", "4095": "out-of-range", "nonsense": "bad"}),
+        )
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.walk_columns",
+            side_effect=lambda ip_str, oid, *a, **k: columns.get(oid, {}),
+        ):
+            vlans = collect_vlans("192.0.2.1", CONFIG)
+        self.assertEqual(len(vlans), 1)
+        self.assertEqual(vlans[0]["vid"], 1)
+
+
 class CollectSystemTests(TestCase):
     def test_system_scalars(self):
         values = {
@@ -358,4 +409,34 @@ class DiscoverTablesTests(TestCase):
                 tables = discover_snmp_tables("192.0.2.1", config)
 
         self.assertEqual(tables["neighbors"], [])
+        mocked.assert_not_called()
+
+    def test_vlans_collected(self):
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.snmp_get",
+            return_value=None,
+        ):
+            with patch(
+                "nautobot_plugin_device_auto_discovery.snmp_tables.collect_vlans",
+                return_value=[{"vid": 10, "name": "Management"}],
+            ) as mocked:
+                tables = discover_snmp_tables("192.0.2.1", CONFIG)
+
+        self.assertEqual(tables["vlans"], [{"vid": 10, "name": "Management"}])
+        mocked.assert_called_once()
+
+    def test_vlans_skipped_when_disabled(self):
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.snmp_get",
+            return_value=None,
+        ):
+            with patch(
+                "nautobot_plugin_device_auto_discovery.snmp_tables.collect_vlans",
+                return_value=[{"vid": 10, "name": "Management"}],
+            ) as mocked:
+                config = dict(CONFIG)
+                config["include_vlans"] = False
+                tables = discover_snmp_tables("192.0.2.1", config)
+
+        self.assertEqual(tables["vlans"], [])
         mocked.assert_not_called()

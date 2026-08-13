@@ -161,6 +161,10 @@ class DiscoveryResult(PrimaryModel):
         default=0,
         help_text="Number of LLDP/CDP neighbors discovered via SNMP.",
     )
+    vlans_found = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of VLANs discovered via SNMP (Q-BRIDGE-MIB).",
+    )
     discovered_data = models.JSONField(
         encoder=django.core.serializers.json.DjangoJSONEncoder,
         blank=True,

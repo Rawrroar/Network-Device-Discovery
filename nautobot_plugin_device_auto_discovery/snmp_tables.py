@@ -8,6 +8,7 @@ common MIB tables used during discovery:
 - IP-MIB address table and ARP (net-to-media) table
 - ENTITY-MIB physical inventory (used for serial numbers)
 - LLDP-MIB and CISCO-CDP-MIB neighbor tables
+- Q-BRIDGE-MIB dot1qVlanStaticTable (VLAN IDs and names)
 
 All collectors return plain Python structures so they can be stored
 in ``DiscoveryResult.discovered_data`` (JSONField) and used to
@@ -86,6 +87,13 @@ OID_CDPCACHETABLE = "1.3.6.1.4.1.9.9.23.1.2.1.1"
 OID_CDPCACHEDEVICEID = OID_CDPCACHETABLE + ".6"
 OID_CDPCACHEDEVICEPORT = OID_CDPCACHETABLE + ".7"
 OID_CDPCACHEPLATFORM = OID_CDPCACHETABLE + ".8"
+
+# Q-BRIDGE-MIB (RFC 4363) dot1qVlanStaticTable (index = dot1qVlanIndex / VLAN ID)
+OID_VLANSTATICTABLE = "1.3.6.1.2.1.17.7.1.4.2.1"
+OID_VLANSTATICEGRESSPORTS = OID_VLANSTATICTABLE + ".2"
+OID_VLANSTATICNAME = OID_VLANSTATICTABLE + ".5"
+OID_VLANSTATICUNTAGGEDPORTS = OID_VLANSTATICTABLE + ".6"
+OID_VLANSTATICROWSTATUS = OID_VLANSTATICTABLE + ".7"
 
 OPER_STATUS_UP = 1
 
@@ -683,6 +691,46 @@ def collect_neighbors(ip_str, config, max_rows=1000):
     return collect_lldp_neighbors(ip_str, config, max_rows) + collect_cdp_neighbors(ip_str, config, max_rows)
 
 
+def collect_vlans(ip_str, config, max_rows=1000):
+    """Collect the Q-BRIDGE-MIB dot1qVlanStaticTable.
+
+    Each entry is indexed by its VLAN ID (dot1qVlanIndex). Only the name
+    and row status columns are walked; the (potentially huge) port-membership
+    bitmaps are skipped.
+
+    Returns:
+        list of dicts: {vid, name, row_status}
+    """
+    community = config.get("snmp_community", "public")
+    timeout = config.get("snmp_timeout", 3)
+    retries = config.get("snmp_retries", 2)
+
+    name_map = walk_columns(ip_str, OID_VLANSTATICNAME, community, timeout, retries, max_rows)
+    if not name_map:
+        return []
+
+    row_status_map = walk_columns(ip_str, OID_VLANSTATICROWSTATUS, community, timeout, retries, max_rows)
+
+    vlans = []
+    for vid, name in name_map.items():
+        try:
+            vid_int = int(float(vid))
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= vid_int <= 4094:
+            continue
+        vlans.append(
+            {
+                "vid": vid_int,
+                "name": name,
+                "row_status": int(float(row_status_map[vid])) if vid in row_status_map else None,
+            }
+        )
+
+    vlans.sort(key=lambda vlan: vlan["vid"])
+    return vlans
+
+
 # ------------------------------------------------------------------ #
 #  Orchestrator                                                       #
 # ------------------------------------------------------------------ #
@@ -695,10 +743,11 @@ def discover_snmp_tables(ip_str, config):
 
     Returns:
         dict with keys: system, interfaces, ip_addresses, arp_table,
-        physical, neighbors
+        physical, neighbors, vlans
     """
     max_rows = config.get("max_walk_oids", 1000)
     include_neighbors = config.get("include_neighbors", True)
+    include_vlans = config.get("include_vlans", True)
 
     tables = {
         "system": {},
@@ -707,6 +756,7 @@ def discover_snmp_tables(ip_str, config):
         "arp_table": [],
         "physical": [],
         "neighbors": [],
+        "vlans": [],
     }
 
     # Quick reachability probe: a host that does not answer SNMP at all
@@ -750,6 +800,12 @@ def discover_snmp_tables(ip_str, config):
             tables["neighbors"] = collect_neighbors(ip_str, config, max_rows=max_rows)
         except Exception as exc:
             logger.debug("SNMP neighbor collection failed for %s: %s", ip_str, exc)
+
+    if include_vlans:
+        try:
+            tables["vlans"] = collect_vlans(ip_str, config, max_rows=max_rows)
+        except Exception as exc:
+            logger.debug("SNMP VLAN collection failed for %s: %s", ip_str, exc)
 
     return tables
 

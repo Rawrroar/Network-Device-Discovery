@@ -7,7 +7,7 @@ A [Nautobot](https://nautobot.com/) App for automatic network device discovery v
 This plugin discovers network devices on your IP ranges and automatically creates them in Nautobot. It supports three discovery methods:
 
 - **ICMP Ping Sweep** — find live hosts in a CIDR range
-- **SNMP Discovery** — query live hosts for hostname, model, vendor, and platform via SNMP
+- **SNMP Discovery** — query live hosts for hostname, model, vendor, platform, and VLANs via SNMP
 - **SSH Discovery** — connect via SSH, run show commands, and parse output for device identification
 
 The **Full Discovery** job orchestrates all three methods in sequence: ping first, then SNMP on live hosts, then SSH on any remaining hosts.
@@ -28,6 +28,7 @@ When a device responds to SNMP, the plugin walks common MIB tables and populates
 - **System scalars** — `sysName`, `sysDescr`, `sysObjectID`, `sysContact`, `sysLocation`
 - **Interfaces (IF-MIB)** — creates `dcim.Interface` objects with name, type, MAC, MTU, speed, admin/oper status (as `Active`/`Maintenance` status and `enabled`), and `ifAlias` as the description
 - **IP addresses (IP-MIB)** — creates `ipam.IPAddress` objects and assigns them to the matching interface
+- **VLANs (Q-BRIDGE-MIB)** — creates `ipam.VLAN` objects (ID + name) under a per-device `VLANGroup`
 - **Physical inventory (ENTITY-MIB)** — used to populate the Device `serial` number
 - **Neighbors (LLDP-MIB / CISCO-CDP-MIB)** — recorded on the `DiscoveryResult` (`neighbors_found`, `discovered_data`), not linked as Cables
 
@@ -77,7 +78,9 @@ PLUGINS_CONFIG = {
         "snmp_community": "public",
         "populate_interfaces": True,
         "populate_ip_addresses": True,
+        "populate_vlans": True,
         "include_neighbors": True,
+        "include_vlans": True,
         "max_walk_oids": 1000,
         "ssh_timeout": 10,
         "ssh_banner_timeout": 30,
@@ -115,10 +118,10 @@ Discovers devices via SNMP:
 1. Navigate to **Jobs > SNMP Discovery**
 2. Enter target network
 3. Provide SNMP community string
-4. Optionally toggle **Populate interfaces**, **Populate IP addresses**, and **Include neighbors**
+4. Optionally toggle **Populate interfaces**, **Populate IP addresses**, **Include neighbors**, and **Populate VLANs**
 5. Run the job
 
-Devices discovered via SNMP are auto-created in Nautobot. Platform identification is done via SNMP OID matching. Interfaces and IP addresses are created from the walked IF-MIB and IP-MIB tables; the Device serial number comes from ENTITY-MIB when available. In dry-run mode, no objects are created but all walked table data is captured on the `DiscoveryResult` for review.
+Devices discovered via SNMP are auto-created in Nautobot. Platform identification is done via SNMP OID matching. Interfaces and IP addresses are created from the walked IF-MIB and IP-MIB tables; the Device serial number comes from ENTITY-MIB when available. VLANs are created from the Q-BRIDGE-MIB `dot1qVlanStaticTable` (ID + name) under a per-device `VLANGroup`. In dry-run mode, no objects are created but all walked table data is captured on the `DiscoveryResult` for review.
 
 ### SSH Discovery
 
@@ -156,7 +159,7 @@ Runs all three methods in sequence:
 1. Navigate to **Jobs > Full Discovery**
 2. Enter target network
 3. Configure SNMP community, SSH credentials
-4. Toggle which methods to enable
+4. Toggle which methods to enable (ping / SNMP / SSH) and whether to populate interfaces, IP addresses, and VLANs
 5. Run the job
 
 The job will:
@@ -210,7 +213,9 @@ For SSH-discovered devices, vendor detection is done via keyword matching on com
 | `snmp_community` | `"public"` | Default SNMP community string |
 | `populate_interfaces` | `True` | Create `dcim.Interface` objects from IF-MIB |
 | `populate_ip_addresses` | `True` | Create/assign `ipam.IPAddress` objects from IP-MIB |
+| `populate_vlans` | `True` | Create `ipam.VLAN` objects from Q-BRIDGE-MIB |
 | `include_neighbors` | `True` | Walk LLDP/CDP neighbor tables |
+| `include_vlans` | `True` | Walk the Q-BRIDGE-MIB VLAN table |
 | `max_walk_oids` | `1000` | Cap on rows walked per MIB table |
 | `ssh_timeout` | `10` | SSH connection timeout in seconds |
 | `ssh_banner_timeout` | `30` | SSH banner wait timeout in seconds |

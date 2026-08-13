@@ -8,7 +8,7 @@ from nautobot.extras.test_tools import run_job_for_testing
 from nautobot.dcim.models import Device, DeviceType, Interface, Location, LocationType, Manufacturer, Platform
 from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
-from nautobot.ipam.models import IPAddress, Prefix
+from nautobot.ipam.models import IPAddress, Prefix, VLAN, VLANGroup
 
 from nautobot_plugin_device_auto_discovery.mappings import lookup_platform_from_oid
 from nautobot_plugin_device_auto_discovery.models import DiscoveryResult
@@ -111,6 +111,7 @@ class SNMPDetectionTests(TestCase):
                 "ip_addresses": [],
                 "arp_table": [],
                 "neighbors": [],
+                "vlans": [],
             },
         ):
             return snmp_discover_device("10.0.0.1", {"snmp_community": "public"})
@@ -509,9 +510,14 @@ class SNMPDiscoveryJobTests(TestCase):
                         "remote_chassis_id": "00:11:22:33:44:55",
                     },
                 ],
+                "vlans": [
+                    {"vid": 1, "name": "default", "row_status": 1},
+                    {"vid": 10, "name": "Management", "row_status": 1},
+                ],
                 "interfaces_found": 2,
                 "ip_addresses_found": 1,
                 "neighbors_found": 1,
+                "vlans_found": 2,
             }
         return None
 
@@ -552,10 +558,17 @@ class SNMPDiscoveryJobTests(TestCase):
         self.assertEqual(discovery_result.interfaces_found, 2)
         self.assertEqual(discovery_result.ip_addresses_found, 1)
         self.assertEqual(discovery_result.neighbors_found, 1)
+        self.assertEqual(discovery_result.vlans_found, 2)
         self.assertEqual(discovery_result.sys_location, "DC1 Row 3")
         self.assertEqual(discovery_result.sys_contact, "noc@example.com")
         self.assertIn("interfaces", discovery_result.discovered_data)
         self.assertEqual(len(discovery_result.discovered_data["neighbors"]), 1)
+        self.assertEqual(len(discovery_result.discovered_data["vlans"]), 2)
+
+        vlan_group = VLANGroup.objects.get(name="switch-001 VLANs")
+        self.assertEqual(VLAN.objects.filter(vlan_group=vlan_group).count(), 2)
+        vlan10 = VLAN.objects.get(vlan_group=vlan_group, vid=10)
+        self.assertEqual(vlan10.name, "Management")
 
     def test_snmp_discovery_idempotent_on_existing_device(self):
         for _ in range(2):
@@ -577,6 +590,8 @@ class SNMPDiscoveryJobTests(TestCase):
         device = Device.objects.get(name="switch-001")
         self.assertEqual(device.interfaces.count(), 2)
         self.assertEqual(IPAddress.objects.filter(address="10.0.0.1/24").count(), 1)
+        vlan_group = VLANGroup.objects.get(name="switch-001 VLANs")
+        self.assertEqual(VLAN.objects.filter(vlan_group=vlan_group).count(), 2)
 
     def test_snmp_discovery_dry_run_creates_nothing(self):
         with patch(
@@ -598,6 +613,7 @@ class SNMPDiscoveryJobTests(TestCase):
 
         self.assertFalse(Device.objects.filter(name="switch-001").exists())
         self.assertFalse(IPAddress.objects.filter(address="10.0.0.1/24").exists())
+        self.assertFalse(VLANGroup.objects.filter(name="switch-001 VLANs").exists())
 
         discovery_result = DiscoveryResult.objects.get(ip_address="10.0.0.1")
         self.assertIn("interfaces", discovery_result.discovered_data)
@@ -618,6 +634,7 @@ class SNMPDiscoveryJobTests(TestCase):
                     "concurrency": 5,
                     "populate_interfaces": False,
                     "populate_ip_addresses": False,
+                    "populate_vlans": False,
                 },
             )
             self.assertEqual(result["created"], 1)
@@ -625,6 +642,7 @@ class SNMPDiscoveryJobTests(TestCase):
         device = Device.objects.get(name="switch-001")
         self.assertEqual(device.interfaces.count(), 0)
         self.assertFalse(IPAddress.objects.filter(address="10.0.0.1/24").exists())
+        self.assertFalse(VLANGroup.objects.filter(name="switch-001 VLANs").exists())
 
 
 class SSHDiscoveryJobTests(TestCase):

@@ -1,0 +1,43 @@
+{% extends 'extras/job.html' %}
+
+{% block javascript %}
+    {{ block.super }}
+    <script type="text/javascript">
+        (() => {
+            window.addEventListener('DOMContentLoaded', () => {
+                const SNMP_V3_FIELDS = [
+                    'snmpv3_username',
+                    'snmpv3_auth_protocol',
+                    'snmpv3_auth_key',
+                    'snmpv3_priv_protocol',
+                    'snmpv3_priv_key',
+                    'snmpv3_context_name',
+                ];
+
+                const setFieldVisible = (name, visible) => {
+                    const container = document.querySelector(`#id_${name}-container`);
+                    if (container) {
+                        container.classList.toggle('d-none', !visible);
+                    }
+                };
+
+                const toggleSnmpVersionFields = () => {
+                    const versionInput = document.querySelector('#id_snmp_version');
+                    if (!versionInput) return;
+                    const value = (versionInput.value || '').trim().toLowerCase();
+                    const isV3 = value === '3' || value === 'v3';
+                    setFieldVisible('snmp_community', !isV3);
+                    SNMP_V3_FIELDS.forEach((name) => setFieldVisible(name, isV3));
+                };
+
+                document.addEventListener('change', (event) => {
+                    if (event.target.closest('#id_snmp_version')) {
+                        toggleSnmpVersionFields();
+                    }
+                });
+
+                toggleSnmpVersionFields();
+            });
+        })();
+    </script>
+{% endblock %}

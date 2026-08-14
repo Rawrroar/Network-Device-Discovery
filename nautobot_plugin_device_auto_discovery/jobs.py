@@ -17,6 +17,7 @@ from netaddr import IPNetwork, IPAddress
 
 from nautobot.apps.jobs import (
     BooleanVar,
+    ChoiceVar,
     DryRunVar,
     IntegerVar,
     IPNetworkVar,
@@ -887,13 +888,15 @@ class SNMPDiscoveryJob(Job):
         dryrun_default = True
         has_sensitive_variables = True
         soft_time_limit = 600
+        template_name = "nautobot_plugin_device_auto_discovery/snmp_job_form.html"
 
     target_network = IPNetworkVar(
         description="CIDR network to scan (e.g., 10.0.0.0/24)"
     )
-    snmp_version = StringVar(
+    snmp_version = ChoiceVar(
         default="2c",
-        description="SNMP version: '1', '2c' (community), or '3' (USM).",
+        choices=(("1", "SNMPv1"), ("2c", "SNMPv2c"), ("3", "SNMPv3")),
+        description="SNMP version to use: v1/v2c community or v3 USM.",
     )
     snmp_community = StringVar(
         default="public",
@@ -1592,13 +1595,15 @@ class FullDiscoveryJob(Job):
         has_sensitive_variables = True
         soft_time_limit = 1800
         time_limit = 3600
+        template_name = "nautobot_plugin_device_auto_discovery/snmp_job_form.html"
 
     target_network = IPNetworkVar(
         description="CIDR network to scan (e.g., 10.0.0.0/24)"
     )
-    snmp_version = StringVar(
+    snmp_version = ChoiceVar(
         default="2c",
-        description="SNMP version: '1', '2c' (community), or '3' (USM).",
+        choices=(("1", "SNMPv1"), ("2c", "SNMPv2c"), ("3", "SNMPv3")),
+        description="SNMP version to use: v1/v2c community or v3 USM.",
     )
     snmp_community = StringVar(
         default="public",

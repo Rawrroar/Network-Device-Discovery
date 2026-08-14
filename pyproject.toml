@@ -38,3 +38,11 @@ nautobot_plugin_device_auto_discovery = "nautobot_plugin_device_auto_discovery"
 
 [tool.setuptools]
 packages = {find = {}}
+
+[tool.setuptools.package-data]
+nautobot_plugin_device_auto_discovery = [
+    "templates/*.html",
+    "templates/**/*.html",
+    "static/*",
+    "static/**/*",
+]

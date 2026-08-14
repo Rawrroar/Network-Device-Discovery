@@ -10,6 +10,11 @@ common MIB tables used during discovery:
 - LLDP-MIB and CISCO-CDP-MIB neighbor tables
 - Q-BRIDGE-MIB dot1qVlanStaticTable (VLAN IDs and names)
 
+Authentication is controlled by the config: SNMPv1/v2c community strings
+(``snmp_community``) or SNMPv3 USM credentials (``snmp_version`` ``"3"``
+plus ``snmpv3_username``, auth/priv protocol and key, optional context
+name). See :func:`build_snmp_auth`.
+
 All collectors return plain Python structures so they can be stored
 in ``DiscoveryResult.discovered_data`` (JSONField) and used to
 populate Nautobot objects. A failure in any single table never
@@ -99,6 +104,118 @@ OPER_STATUS_UP = 1
 
 
 # ------------------------------------------------------------------ #
+#  SNMPv3 USM protocol OIDs                                           #
+# ------------------------------------------------------------------ #
+
+# Authentication protocol identifiers (RFC 3414 usmAuthProtocol).
+USM_AUTH_PROTOCOLS = {
+    "": None,
+    "none": None,
+    "noauth": None,
+    "md5": (1, 3, 6, 1, 6, 3, 10, 1, 1, 2),
+    "sha": (1, 3, 6, 1, 6, 3, 10, 1, 1, 3),
+    "sha-224": (1, 3, 6, 1, 6, 3, 10, 1, 1, 4),
+    "sha224": (1, 3, 6, 1, 6, 3, 10, 1, 1, 4),
+    "sha-256": (1, 3, 6, 1, 6, 3, 10, 1, 1, 5),
+    "sha256": (1, 3, 6, 1, 6, 3, 10, 1, 1, 5),
+    "sha-384": (1, 3, 6, 1, 6, 3, 10, 1, 1, 6),
+    "sha384": (1, 3, 6, 1, 6, 3, 10, 1, 1, 6),
+    "sha-512": (1, 3, 6, 1, 6, 3, 10, 1, 1, 7),
+    "sha512": (1, 3, 6, 1, 6, 3, 10, 1, 1, 7),
+}
+
+# Privacy/encryption protocol identifiers (RFC 3414 usmPrivProtocol plus
+# the common AES-192/AES-256 variants).
+USM_PRIV_PROTOCOLS = {
+    "": None,
+    "none": None,
+    "nopriv": None,
+    "des": (1, 3, 6, 1, 6, 3, 10, 1, 2, 2),
+    "3des": (1, 3, 6, 1, 6, 3, 10, 1, 2, 3),
+    "aes": (1, 3, 6, 1, 6, 3, 10, 1, 2, 4),
+    "aes-128": (1, 3, 6, 1, 6, 3, 10, 1, 2, 4),
+    "aes-192": (1, 3, 6, 1, 4, 1, 9, 12, 6, 1, 101),
+    "aes-256": (1, 3, 6, 1, 4, 1, 9, 12, 6, 1, 102),
+}
+
+
+def build_snmp_auth(config):
+    """Build the SNMP auth/context dict consumed by the low-level helpers.
+
+    Reads ``snmp_version`` from the config: ``"3"`` selects SNMPv3 USM
+    credentials (``snmpv3_username``, optional auth/priv protocol + key and
+    context name), anything else falls back to a v1/v2c community string
+    (``snmp_community``).
+
+    Returns:
+        dict with ``version`` (1, 2 or 3) plus either a ``community`` or the
+        USM fields (``user``, ``auth_protocol``, ``auth_key``,
+        ``priv_protocol``, ``priv_key``) and an optional ``context``.
+    """
+    version = str(config.get("snmp_version", "2c")).strip().lower()
+    if version == "3":
+        return {
+            "version": 3,
+            "context": config.get("snmpv3_context_name", ""),
+            "user": config.get("snmpv3_username", ""),
+            "auth_protocol": config.get("snmpv3_auth_protocol", "SHA"),
+            "auth_key": config.get("snmpv3_auth_key", ""),
+            "priv_protocol": config.get("snmpv3_priv_protocol", "AES"),
+            "priv_key": config.get("snmpv3_priv_key", ""),
+        }
+    return {
+        "version": 1 if version == "1" else 2,
+        "context": "",
+        "community": config.get("snmp_community", "public"),
+    }
+
+
+def _coerce_auth(auth):
+    """Accept an auth dict (from build_snmp_auth) or a plain community string."""
+    if isinstance(auth, dict):
+        return auth
+    return {"version": 2, "community": auth or "public", "context": ""}
+
+
+def _auth_data(api, auth):
+    """Build the pysnmp auth data: CommunityData (v1/v2c) or UsmUserData (v3).
+
+    For SNMPv3, a protocol is only applied when the matching key is set, so
+    a user without an auth key gets noAuth and one without a priv key gets
+    noPriv (matching the usual noAuthNoPriv/authNoPriv/authPriv modes).
+    """
+    if auth.get("version") == 3:
+        auth_key = auth.get("auth_key") or None
+        priv_key = auth.get("priv_key") or None
+        auth_protocol = None
+        priv_protocol = None
+        if auth_key:
+            auth_protocol = USM_AUTH_PROTOCOLS.get(
+                str(auth.get("auth_protocol", "SHA")).strip().lower()
+            )
+        if priv_key:
+            priv_protocol = USM_PRIV_PROTOCOLS.get(
+                str(auth.get("priv_protocol", "AES")).strip().lower()
+            )
+        return api["UsmUserData"](
+            auth.get("user", ""),
+            authKey=auth_key,
+            privKey=priv_key,
+            authProtocol=auth_protocol,
+            privProtocol=priv_protocol,
+        )
+    return api["CommunityData"](
+        auth.get("community", "public"),
+        mpModel=0 if auth.get("version") == 1 else 1,
+    )
+
+
+def _context_data(api, auth):
+    """Build the pysnmp ContextData, honoring an optional SNMPv3 context name."""
+    return api["ContextData"](auth.get("context", ""))
+
+
+# ------------------------------------------------------------------ #
 #  Low-level SNMP helpers                                             #
 # ------------------------------------------------------------------ #
 
@@ -116,6 +233,7 @@ def _load_snmp_api():
         from pysnmp.hlapi import (  # noqa: PLC0415 - classic sync API, pysnmp < 7
             SnmpEngine,
             CommunityData,
+            UsmUserData,
             UdpTransportTarget,
             ContextData,
             ObjectType,
@@ -128,6 +246,7 @@ def _load_snmp_api():
             "kind": "classic",
             "SnmpEngine": SnmpEngine,
             "CommunityData": CommunityData,
+            "UsmUserData": UsmUserData,
             "UdpTransportTarget": UdpTransportTarget,
             "ContextData": ContextData,
             "ObjectType": ObjectType,
@@ -142,6 +261,7 @@ def _load_snmp_api():
         from pysnmp.hlapi.asyncio import (  # noqa: PLC0415 - asyncio API, pysnmp >= 7
             SnmpEngine,
             CommunityData,
+            UsmUserData,
             UdpTransportTarget,
             ContextData,
             ObjectType,
@@ -154,6 +274,7 @@ def _load_snmp_api():
             "kind": "async",
             "SnmpEngine": SnmpEngine,
             "CommunityData": CommunityData,
+            "UsmUserData": UsmUserData,
             "UdpTransportTarget": UdpTransportTarget,
             "ContextData": ContextData,
             "ObjectType": ObjectType,
@@ -170,11 +291,6 @@ def _get_snmp_api():
         _snmp_api_cache["value"] = _load_snmp_api()
         _snmp_api_cache["resolved"] = True
     return _snmp_api_cache["value"]
-
-
-def _community_kwargs(community):
-    """Build kwargs for CommunityData (SNMPv2c)."""
-    return {"mpModel": 0}
 
 
 def _run_async(coro):
@@ -195,13 +311,13 @@ def _run_async(coro):
     return result["value"]
 
 
-def _classic_get(api, ip_str, oid, community, timeout, retries):
+def _classic_get(api, ip_str, oid, auth, timeout, retries):
     error_indication, error_status, error_index, var_binds = next(
         api["getCmd"](
             api["SnmpEngine"](),
-            api["CommunityData"](community, **_community_kwargs(community)),
+            _auth_data(api, auth),
             api["UdpTransportTarget"]((ip_str, 161), timeout=timeout, retries=retries),
-            api["ContextData"](),
+            _context_data(api, auth),
             api["ObjectType"](api["ObjectIdentity"](oid)),
         )
     )
@@ -210,13 +326,13 @@ def _classic_get(api, ip_str, oid, community, timeout, retries):
     return None
 
 
-async def _async_get_impl(api, ip_str, oid, community, timeout, retries):
+async def _async_get_impl(api, ip_str, oid, auth, timeout, retries):
     transport = await api["UdpTransportTarget"].create((ip_str, 161), timeout=timeout, retries=retries)
     error_indication, error_status, error_index, var_binds = await api["get_cmd"](
         api["SnmpEngine"](),
-        api["CommunityData"](community, **_community_kwargs(community)),
+        _auth_data(api, auth),
         transport,
-        api["ContextData"](),
+        _context_data(api, auth),
         api["ObjectType"](api["ObjectIdentity"](oid)),
     )
     if not error_indication and not error_status and var_binds:
@@ -224,12 +340,15 @@ async def _async_get_impl(api, ip_str, oid, community, timeout, retries):
     return None
 
 
-def _async_get(api, ip_str, oid, community, timeout, retries):
-    return _run_async(_async_get_impl(api, ip_str, oid, community, timeout, retries))
+def _async_get(api, ip_str, oid, auth, timeout, retries):
+    return _run_async(_async_get_impl(api, ip_str, oid, auth, timeout, retries))
 
 
-def snmp_get(ip_str, oid, community="public", timeout=3, retries=2):
-    """Perform an SNMP GET request (SNMPv2c).
+def snmp_get(ip_str, oid, auth="public", timeout=3, retries=2):
+    """Perform an SNMP GET request (v1/v2c community or v3 USM).
+
+    ``auth`` is either an auth dict from :func:`build_snmp_auth` or, for
+    backward compatibility, a plain community string (treated as v2c).
 
     Returns:
         str value or None on failure.
@@ -239,23 +358,25 @@ def snmp_get(ip_str, oid, community="public", timeout=3, retries=2):
         logger.warning("pysnmp not installed or unsupported; SNMP discovery will not work.")
         return None
 
+    auth = _coerce_auth(auth)
+
     try:
         if api["kind"] == "classic":
-            return _classic_get(api, ip_str, oid, community, timeout, retries)
-        return _async_get(api, ip_str, oid, community, timeout, retries)
+            return _classic_get(api, ip_str, oid, auth, timeout, retries)
+        return _async_get(api, ip_str, oid, auth, timeout, retries)
     except Exception as exc:
         logger.debug("SNMP GET failed for %s OID %s: %s", ip_str, oid, exc)
         return None
 
 
-def _classic_walk(api, ip_str, oid, community, timeout, retries, max_rows):
+def _classic_walk(api, ip_str, oid, auth, timeout, retries, max_rows):
     rows = []
     prefix = oid.rstrip(".") + "."
     for error_indication, error_status, error_index, var_binds in api["nextCmd"](
         api["SnmpEngine"](),
-        api["CommunityData"](community, **_community_kwargs(community)),
+        _auth_data(api, auth),
         api["UdpTransportTarget"]((ip_str, 161), timeout=timeout, retries=retries),
-        api["ContextData"](),
+        _context_data(api, auth),
         api["ObjectType"](api["ObjectIdentity"](oid)),
         lexicographicMode=False,
         maxRows=max_rows,
@@ -271,15 +392,15 @@ def _classic_walk(api, ip_str, oid, community, timeout, retries, max_rows):
     return rows
 
 
-async def _async_walk_impl(api, ip_str, oid, community, timeout, retries, max_rows):
+async def _async_walk_impl(api, ip_str, oid, auth, timeout, retries, max_rows):
     transport = await api["UdpTransportTarget"].create((ip_str, 161), timeout=timeout, retries=retries)
     rows = []
     prefix = oid.rstrip(".") + "."
     async for error_indication, error_status, error_index, var_binds in api["walk_cmd"](
         api["SnmpEngine"](),
-        api["CommunityData"](community, **_community_kwargs(community)),
+        _auth_data(api, auth),
         transport,
-        api["ContextData"](),
+        _context_data(api, auth),
         api["ObjectType"](api["ObjectIdentity"](oid)),
         lexicographicMode=False,
         maxRows=max_rows,
@@ -295,12 +416,15 @@ async def _async_walk_impl(api, ip_str, oid, community, timeout, retries, max_ro
     return rows
 
 
-def _async_walk(api, ip_str, oid, community, timeout, retries, max_rows):
-    return _run_async(_async_walk_impl(api, ip_str, oid, community, timeout, retries, max_rows))
+def _async_walk(api, ip_str, oid, auth, timeout, retries, max_rows):
+    return _run_async(_async_walk_impl(api, ip_str, oid, auth, timeout, retries, max_rows))
 
 
-def snmp_walk(ip_str, oid, community="public", timeout=3, retries=2, max_rows=1000):
+def snmp_walk(ip_str, oid, auth="public", timeout=3, retries=2, max_rows=1000):
     """Walk a subtree via SNMP GETNEXT.
+
+    ``auth`` is either an auth dict from :func:`build_snmp_auth` or, for
+    backward compatibility, a plain community string (treated as v2c).
 
     Returns:
         list of (full_oid, value) tuples, or [] on any failure.
@@ -311,22 +435,24 @@ def snmp_walk(ip_str, oid, community="public", timeout=3, retries=2, max_rows=10
         logger.warning("pysnmp not installed or unsupported; SNMP discovery will not work.")
         return []
 
+    auth = _coerce_auth(auth)
+
     try:
         if api["kind"] == "classic":
-            return _classic_walk(api, ip_str, oid, community, timeout, retries, max_rows)
-        return _async_walk(api, ip_str, oid, community, timeout, retries, max_rows)
+            return _classic_walk(api, ip_str, oid, auth, timeout, retries, max_rows)
+        return _async_walk(api, ip_str, oid, auth, timeout, retries, max_rows)
     except Exception as exc:
         logger.debug("SNMP WALK failed for %s OID %s: %s", ip_str, oid, exc)
         return []
 
 
-def walk_columns(ip_str, oid, community, timeout, retries, max_rows):
+def walk_columns(ip_str, oid, auth, timeout, retries, max_rows):
     """Walk a table column and return {index_suffix: value}.
 
     The index suffix is the OID remainder after the column base OID.
     """
     column_map = {}
-    for full_oid, value in snmp_walk(ip_str, oid, community, timeout, retries, max_rows):
+    for full_oid, value in snmp_walk(ip_str, oid, auth, timeout, retries, max_rows):
         if full_oid.startswith(oid + "."):
             column_map[full_oid[len(oid) + 1 :]] = value
     return column_map
@@ -362,17 +488,17 @@ def _if_type_name(code, speed=None):
 
 def collect_system(ip_str, config):
     """Collect system scalars (SNMPv2-MIB system group)."""
-    community = config.get("snmp_community", "public")
+    auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
 
     return {
-        "sys_name": snmp_get(ip_str, OID_SYSNAME, community, timeout, retries) or "",
-        "sys_descr": snmp_get(ip_str, OID_SYSDESCR, community, timeout, retries) or "",
-        "sys_object_id": snmp_get(ip_str, OID_SYSOBJECTID, community, timeout, retries) or "",
-        "sys_contact": snmp_get(ip_str, OID_SYSCONTACT, community, timeout, retries) or "",
-        "sys_location": snmp_get(ip_str, OID_SYSLOCATION, community, timeout, retries) or "",
-        "sys_uptime": snmp_get(ip_str, OID_SYSUPTIME, community, timeout, retries) or "",
+        "sys_name": snmp_get(ip_str, OID_SYSNAME, auth, timeout, retries) or "",
+        "sys_descr": snmp_get(ip_str, OID_SYSDESCR, auth, timeout, retries) or "",
+        "sys_object_id": snmp_get(ip_str, OID_SYSOBJECTID, auth, timeout, retries) or "",
+        "sys_contact": snmp_get(ip_str, OID_SYSCONTACT, auth, timeout, retries) or "",
+        "sys_location": snmp_get(ip_str, OID_SYSLOCATION, auth, timeout, retries) or "",
+        "sys_uptime": snmp_get(ip_str, OID_SYSUPTIME, auth, timeout, retries) or "",
     }
 
 
@@ -383,23 +509,23 @@ def collect_interfaces(ip_str, config, max_rows=1000):
         list of dicts: {index, name, descr, type, mtu, speed, mac,
                         admin_status, oper_status, alias, high_speed}
     """
-    community = config.get("snmp_community", "public")
+    auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
 
-    descr_map = walk_columns(ip_str, OID_IFDESCR, community, timeout, retries, max_rows)
+    descr_map = walk_columns(ip_str, OID_IFDESCR, auth, timeout, retries, max_rows)
     if not descr_map:
         return []
 
-    type_map = walk_columns(ip_str, OID_IFTYPE, community, timeout, retries, max_rows)
-    mtu_map = walk_columns(ip_str, OID_IFMTU, community, timeout, retries, max_rows)
-    speed_map = walk_columns(ip_str, OID_IFSPEED, community, timeout, retries, max_rows)
-    phys_map = walk_columns(ip_str, OID_IFPHYSADDRESS, community, timeout, retries, max_rows)
-    admin_map = walk_columns(ip_str, OID_IFADMINSTATUS, community, timeout, retries, max_rows)
-    oper_map = walk_columns(ip_str, OID_IFOPERSTATUS, community, timeout, retries, max_rows)
-    name_map = walk_columns(ip_str, OID_IFNAME, community, timeout, retries, max_rows)
-    high_speed_map = walk_columns(ip_str, OID_IFHISPEED, community, timeout, retries, max_rows)
-    alias_map = walk_columns(ip_str, OID_IFALIAS, community, timeout, retries, max_rows)
+    type_map = walk_columns(ip_str, OID_IFTYPE, auth, timeout, retries, max_rows)
+    mtu_map = walk_columns(ip_str, OID_IFMTU, auth, timeout, retries, max_rows)
+    speed_map = walk_columns(ip_str, OID_IFSPEED, auth, timeout, retries, max_rows)
+    phys_map = walk_columns(ip_str, OID_IFPHYSADDRESS, auth, timeout, retries, max_rows)
+    admin_map = walk_columns(ip_str, OID_IFADMINSTATUS, auth, timeout, retries, max_rows)
+    oper_map = walk_columns(ip_str, OID_IFOPERSTATUS, auth, timeout, retries, max_rows)
+    name_map = walk_columns(ip_str, OID_IFNAME, auth, timeout, retries, max_rows)
+    high_speed_map = walk_columns(ip_str, OID_IFHISPEED, auth, timeout, retries, max_rows)
+    alias_map = walk_columns(ip_str, OID_IFALIAS, auth, timeout, retries, max_rows)
 
     interfaces = []
     for index in descr_map:
@@ -446,15 +572,15 @@ def collect_ip_addresses(ip_str, config, max_rows=1000):
     Returns:
         list of dicts: {address, prefix_length, if_index}
     """
-    community = config.get("snmp_community", "public")
+    auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
 
     addresses = []
 
     # RFC 1213 ipAddrTable (index = IP address)
-    ifindex_map = walk_columns(ip_str, OID_IPADENTIFINDEX, community, timeout, retries, max_rows)
-    netmask_map = walk_columns(ip_str, OID_IPADENTNETMASK, community, timeout, retries, max_rows)
+    ifindex_map = walk_columns(ip_str, OID_IPADENTIFINDEX, auth, timeout, retries, max_rows)
+    netmask_map = walk_columns(ip_str, OID_IPADENTNETMASK, auth, timeout, retries, max_rows)
     if ifindex_map:
         for addr, if_index in ifindex_map.items():
             prefix_length = _netmask_to_prefix(netmask_map.get(addr, ""))
@@ -470,7 +596,7 @@ def collect_ip_addresses(ip_str, config, max_rows=1000):
 
     # IP-MIB ipAddressTable fallback (index = IPv4/IPv6 string)
     if not addresses:
-        addr_ifindex_map = walk_columns(ip_str, OID_IPADDRESSIFINDEX, community, timeout, retries, max_rows)
+        addr_ifindex_map = walk_columns(ip_str, OID_IPADDRESSIFINDEX, auth, timeout, retries, max_rows)
         for addr, if_index in addr_ifindex_map.items():
             addresses.append(
                 {
@@ -489,12 +615,12 @@ def collect_arp_table(ip_str, config, max_rows=1000):
     Returns:
         list of dicts: {if_index, ip, mac}
     """
-    community = config.get("snmp_community", "public")
+    auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
 
-    ifindex_map = walk_columns(ip_str, OID_IPNETTOMEDIAIFINDEX, community, timeout, retries, max_rows)
-    phys_map = walk_columns(ip_str, OID_IPNETTOMEDIAPHYSADDRESS, community, timeout, retries, max_rows)
+    ifindex_map = walk_columns(ip_str, OID_IPNETTOMEDIAIFINDEX, auth, timeout, retries, max_rows)
+    phys_map = walk_columns(ip_str, OID_IPNETTOMEDIAPHYSADDRESS, auth, timeout, retries, max_rows)
 
     entries = []
     for ip_addr, if_index in ifindex_map.items():
@@ -511,18 +637,18 @@ def collect_physical(ip_str, config, max_rows=1000):
     Returns:
         list of dicts: {index, class, name, descr, model, serial}
     """
-    community = config.get("snmp_community", "public")
+    auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
 
-    descr_map = walk_columns(ip_str, OID_ENTPHYSDESCR, community, timeout, retries, max_rows)
+    descr_map = walk_columns(ip_str, OID_ENTPHYSDESCR, auth, timeout, retries, max_rows)
     if not descr_map:
         return []
 
-    class_map = walk_columns(ip_str, OID_ENTPHYSCLASS, community, timeout, retries, max_rows)
-    name_map = walk_columns(ip_str, OID_ENTPHYSNAME, community, timeout, retries, max_rows)
-    serial_map = walk_columns(ip_str, OID_ENTPHYSSERIALNUM, community, timeout, retries, max_rows)
-    model_map = walk_columns(ip_str, OID_ENTPHYSMODELNAME, community, timeout, retries, max_rows)
+    class_map = walk_columns(ip_str, OID_ENTPHYSCLASS, auth, timeout, retries, max_rows)
+    name_map = walk_columns(ip_str, OID_ENTPHYSNAME, auth, timeout, retries, max_rows)
+    serial_map = walk_columns(ip_str, OID_ENTPHYSSERIALNUM, auth, timeout, retries, max_rows)
+    model_map = walk_columns(ip_str, OID_ENTPHYSMODELNAME, auth, timeout, retries, max_rows)
 
     entities = []
     for index in descr_map:
@@ -608,20 +734,20 @@ def collect_lldp_neighbors(ip_str, config, max_rows=1000):
         list of dicts: {local_if_index, local_port_num, remote_name,
                         remote_port, remote_description, remote_ip}
     """
-    community = config.get("snmp_community", "public")
+    auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
 
     # Map local port number -> ifIndex
-    local_port_ifindex = walk_columns(ip_str, OID_LLDPLOCPORTIFINDEX, community, timeout, retries, max_rows)
+    local_port_ifindex = walk_columns(ip_str, OID_LLDPLOCPORTIFINDEX, auth, timeout, retries, max_rows)
 
-    sysname_map = walk_columns(ip_str, OID_LLDPREMSYSNAME, community, timeout, retries, max_rows)
+    sysname_map = walk_columns(ip_str, OID_LLDPREMSYSNAME, auth, timeout, retries, max_rows)
     if not sysname_map:
         return []
 
-    port_id_map = walk_columns(ip_str, OID_LLDPREMPORTID, community, timeout, retries, max_rows)
-    sysdesc_map = walk_columns(ip_str, OID_LLDPREMSYSDESC, community, timeout, retries, max_rows)
-    chassis_map = walk_columns(ip_str, OID_LLDPREMCHASSISID, community, timeout, retries, max_rows)
+    port_id_map = walk_columns(ip_str, OID_LLDPREMPORTID, auth, timeout, retries, max_rows)
+    sysdesc_map = walk_columns(ip_str, OID_LLDPREMSYSDESC, auth, timeout, retries, max_rows)
+    chassis_map = walk_columns(ip_str, OID_LLDPREMCHASSISID, auth, timeout, retries, max_rows)
 
     neighbors = []
     for index, sys_name in sysname_map.items():
@@ -651,16 +777,16 @@ def collect_cdp_neighbors(ip_str, config, max_rows=1000):
     Returns:
         list of dicts with same shape as LLDP neighbors.
     """
-    community = config.get("snmp_community", "public")
+    auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
 
-    device_map = walk_columns(ip_str, OID_CDPCACHEDEVICEID, community, timeout, retries, max_rows)
+    device_map = walk_columns(ip_str, OID_CDPCACHEDEVICEID, auth, timeout, retries, max_rows)
     if not device_map:
         return []
 
-    port_map = walk_columns(ip_str, OID_CDPCACHEDEVICEPORT, community, timeout, retries, max_rows)
-    platform_map = walk_columns(ip_str, OID_CDPCACHEPLATFORM, community, timeout, retries, max_rows)
+    port_map = walk_columns(ip_str, OID_CDPCACHEDEVICEPORT, auth, timeout, retries, max_rows)
+    platform_map = walk_columns(ip_str, OID_CDPCACHEPLATFORM, auth, timeout, retries, max_rows)
 
     neighbors = []
     for index, device_id in device_map.items():
@@ -701,15 +827,15 @@ def collect_vlans(ip_str, config, max_rows=1000):
     Returns:
         list of dicts: {vid, name, row_status}
     """
-    community = config.get("snmp_community", "public")
+    auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
 
-    name_map = walk_columns(ip_str, OID_VLANSTATICNAME, community, timeout, retries, max_rows)
+    name_map = walk_columns(ip_str, OID_VLANSTATICNAME, auth, timeout, retries, max_rows)
     if not name_map:
         return []
 
-    row_status_map = walk_columns(ip_str, OID_VLANSTATICROWSTATUS, community, timeout, retries, max_rows)
+    row_status_map = walk_columns(ip_str, OID_VLANSTATICROWSTATUS, auth, timeout, retries, max_rows)
 
     vlans = []
     for vid, name in name_map.items():
@@ -763,10 +889,10 @@ def discover_snmp_tables(ip_str, config):
     # would otherwise burn a multi-second timeout on *every* scalar GET
     # and column walk below (~150s per silent host). One sysName GET is
     # enough to decide that SNMP is not available and skip the rest.
-    community = config.get("snmp_community", "public")
+    auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
-    if not snmp_get(ip_str, OID_SYSNAME, community, timeout, retries):
+    if not snmp_get(ip_str, OID_SYSNAME, auth, timeout, retries):
         logger.debug("SNMP not responding on %s; skipping table walks", ip_str)
         return tables
 

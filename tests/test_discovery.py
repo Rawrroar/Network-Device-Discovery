@@ -432,6 +432,53 @@ class SNMPDiscoveryJobTests(TestCase):
             self.assertIn("created", result)
             self.assertGreaterEqual(result["discovered"], 0)
 
+    def test_snmp_discovery_v3_passes_usm_config(self):
+        captured = {}
+
+        def mock_snmp_discover(ip_str, config):
+            captured["config"] = config
+            return None
+
+        with patch(
+            "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
+            side_effect=mock_snmp_discover,
+        ):
+            run_job_for_testing(
+                SNMPDiscoveryJob,
+                data={
+                    "target_network": "10.0.0.0/30",
+                    "snmp_version": "3",
+                    "snmpv3_username": "discover",
+                    "snmpv3_auth_protocol": "SHA-256",
+                    "snmpv3_auth_key": "auth-pass",
+                    "snmpv3_priv_protocol": "AES-192",
+                    "snmpv3_priv_key": "priv-pass",
+                    "snmpv3_context_name": "ctx",
+                    "timeout": 1,
+                    "concurrency": 5,
+                },
+            )
+
+        self.assertEqual(captured["config"]["snmp_version"], "3")
+        self.assertEqual(captured["config"]["snmpv3_username"], "discover")
+        self.assertEqual(captured["config"]["snmpv3_auth_protocol"], "SHA-256")
+        self.assertEqual(captured["config"]["snmpv3_auth_key"], "auth-pass")
+        self.assertEqual(captured["config"]["snmpv3_priv_protocol"], "AES-192")
+        self.assertEqual(captured["config"]["snmpv3_priv_key"], "priv-pass")
+        self.assertEqual(captured["config"]["snmpv3_context_name"], "ctx")
+
+    def test_snmp_discovery_invalid_version_fails(self):
+        result = run_job_for_testing(
+            SNMPDiscoveryJob,
+            data={
+                "target_network": "10.0.0.0/30",
+                "snmp_version": "7",
+                "timeout": 1,
+                "concurrency": 5,
+            },
+        )
+        self.assertIn("error", result)
+
     def test_snmp_discovery_no_devices(self):
         with patch(
             "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",

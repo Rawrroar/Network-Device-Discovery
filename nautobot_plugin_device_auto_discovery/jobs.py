@@ -559,8 +559,9 @@ def snmp_discover_device(ip_str, config):
 
     if not sys_name and not sys_descr:
         logger.debug(
-            "No SNMP system info from %s (community %r); host may not be SNMP-reachable",
+            "No SNMP system info from %s (version %s, community %r); host may not be SNMP-reachable",
             ip_str,
+            config.get("snmp_version", "2c"),
             config.get("snmp_community", "public"),
         )
         return None
@@ -879,17 +880,48 @@ class SNMPDiscoveryJob(Job):
         Discovered devices are automatically created in Nautobot with
         auto-generated Manufacturer, DeviceType, and Platform objects.
         Interfaces, IP addresses, and VLANs are populated from the walked tables.
+
+        Authentication is community-based (v1/v2c) by default. Set
+        ``snmp_version`` to ``3`` to use SNMPv3 USM credentials instead.
         """
         dryrun_default = True
-        has_sensitive_variables = False
+        has_sensitive_variables = True
         soft_time_limit = 600
 
     target_network = IPNetworkVar(
         description="CIDR network to scan (e.g., 10.0.0.0/24)"
     )
+    snmp_version = StringVar(
+        default="2c",
+        description="SNMP version: '1', '2c' (community), or '3' (USM).",
+    )
     snmp_community = StringVar(
         default="public",
-        description="SNMP community string (overrides plugin default).",
+        description="SNMP community string (used for v1/v2c; overrides plugin default).",
+    )
+    snmpv3_username = StringVar(
+        default="",
+        description="SNMPv3 USM username (used when snmp_version is '3').",
+    )
+    snmpv3_auth_protocol = StringVar(
+        default="SHA",
+        description="SNMPv3 authentication protocol: noAuth, MD5, SHA, SHA-256, SHA-384, SHA-512. Ignored without an auth key.",
+    )
+    snmpv3_auth_key = StringVar(
+        default="",
+        description="SNMPv3 authentication passphrase. Sensitive; do not schedule or approve runs.",
+    )
+    snmpv3_priv_protocol = StringVar(
+        default="AES",
+        description="SNMPv3 privacy protocol: noPriv, DES, 3DES, AES, AES-192, AES-256. Ignored without a privacy key.",
+    )
+    snmpv3_priv_key = StringVar(
+        default="",
+        description="SNMPv3 privacy/encryption passphrase. Sensitive; do not schedule or approve runs.",
+    )
+    snmpv3_context_name = StringVar(
+        default="",
+        description="Optional SNMPv3 context name (for v3B / context-engine-ID setups).",
     )
     timeout = IntegerVar(
         default=3,
@@ -925,9 +957,25 @@ class SNMPDiscoveryJob(Job):
     )
     dryrun = DryRunVar()
 
-    def run(self, *, target_network, snmp_community, timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, include_vlans=True, populate_vlans=True, dryrun=False):
+    def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, include_vlans=True, populate_vlans=True, dryrun=False):
         config = get_plugin_config()
+        snmp_version = str(snmp_version or "2c").strip().lower()
+        if snmp_version.startswith("v"):
+            snmp_version = snmp_version[1:]
+        if snmp_version not in ("1", "2", "2c", "3"):
+            self.logger.error("Invalid snmp_version %r; expected '1', '2c', or '3'.", snmp_version)
+            return {"error": f"Invalid snmp_version {snmp_version!r}"}
+        if snmp_version == "3" and not (snmpv3_username or "").strip():
+            self.logger.error("snmp_version '3' requires an SNMPv3 username.")
+            return {"error": "snmp_version '3' requires an SNMPv3 username"}
+        config["snmp_version"] = snmp_version
         config["snmp_community"] = snmp_community or config.get("snmp_community", "public")
+        config["snmpv3_username"] = snmpv3_username or ""
+        config["snmpv3_auth_protocol"] = snmpv3_auth_protocol or "SHA"
+        config["snmpv3_auth_key"] = snmpv3_auth_key or ""
+        config["snmpv3_priv_protocol"] = snmpv3_priv_protocol or "AES"
+        config["snmpv3_priv_key"] = snmpv3_priv_key or ""
+        config["snmpv3_context_name"] = snmpv3_context_name or ""
         config["snmp_timeout"] = timeout
         config["snmp_retries"] = 2
         config["populate_interfaces"] = populate_interfaces
@@ -1548,9 +1596,37 @@ class FullDiscoveryJob(Job):
     target_network = IPNetworkVar(
         description="CIDR network to scan (e.g., 10.0.0.0/24)"
     )
+    snmp_version = StringVar(
+        default="2c",
+        description="SNMP version: '1', '2c' (community), or '3' (USM).",
+    )
     snmp_community = StringVar(
         default="public",
-        description="SNMP community string.",
+        description="SNMP community string (used for v1/v2c).",
+    )
+    snmpv3_username = StringVar(
+        default="",
+        description="SNMPv3 USM username (used when snmp_version is '3').",
+    )
+    snmpv3_auth_protocol = StringVar(
+        default="SHA",
+        description="SNMPv3 authentication protocol: noAuth, MD5, SHA, SHA-256, SHA-384, SHA-512. Ignored without an auth key.",
+    )
+    snmpv3_auth_key = StringVar(
+        default="",
+        description="SNMPv3 authentication passphrase. Sensitive; do not schedule or approve runs.",
+    )
+    snmpv3_priv_protocol = StringVar(
+        default="AES",
+        description="SNMPv3 privacy protocol: noPriv, DES, 3DES, AES, AES-192, AES-256. Ignored without a privacy key.",
+    )
+    snmpv3_priv_key = StringVar(
+        default="",
+        description="SNMPv3 privacy/encryption passphrase. Sensitive; do not schedule or approve runs.",
+    )
+    snmpv3_context_name = StringVar(
+        default="",
+        description="Optional SNMPv3 context name (for v3B / context-engine-ID setups).",
     )
     ssh_username = StringVar(
         default="admin",
@@ -1606,7 +1682,7 @@ class FullDiscoveryJob(Job):
         description="Number of concurrent probes.",
     )
 
-    def run(self, *, target_network, snmp_community, ssh_username, ssh_password,
+    def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", ssh_username, ssh_password,
             enable_ping, enable_snmp, enable_ssh, populate_interfaces=True, populate_ip_addresses=True,
             include_neighbors=True, include_vlans=True, populate_vlans=True, dryrun=False, timeout, concurrency):
         config = get_plugin_config()
@@ -1615,6 +1691,23 @@ class FullDiscoveryJob(Job):
         config["include_neighbors"] = include_neighbors
         config["include_vlans"] = include_vlans
         config["populate_vlans"] = populate_vlans
+        snmp_version = str(snmp_version or "2c").strip().lower()
+        if snmp_version.startswith("v"):
+            snmp_version = snmp_version[1:]
+        if snmp_version not in ("1", "2", "2c", "3"):
+            self.logger.error("Invalid snmp_version %r; expected '1', '2c', or '3'.", snmp_version)
+            return {"error": f"Invalid snmp_version {snmp_version!r}"}
+        if snmp_version == "3" and not (snmpv3_username or "").strip():
+            self.logger.error("snmp_version '3' requires an SNMPv3 username.")
+            return {"error": "snmp_version '3' requires an SNMPv3 username"}
+        config["snmp_version"] = snmp_version
+        config["snmp_community"] = snmp_community or config.get("snmp_community", "public")
+        config["snmpv3_username"] = snmpv3_username or ""
+        config["snmpv3_auth_protocol"] = snmpv3_auth_protocol or "SHA"
+        config["snmpv3_auth_key"] = snmpv3_auth_key or ""
+        config["snmpv3_priv_protocol"] = snmpv3_priv_protocol or "AES"
+        config["snmpv3_priv_key"] = snmpv3_priv_key or ""
+        config["snmpv3_context_name"] = snmpv3_context_name or ""
         ssh_username = ssh_username or config.get("ssh_username", "admin")
         ssh_password = ssh_password or config.get("ssh_password", "")
         ssh_port = config.get("ssh_port", 22)
@@ -1664,7 +1757,6 @@ class FullDiscoveryJob(Job):
         snmp_results = {}
         if enable_snmp and live_hosts:
             self.logger.info("Phase 2: SNMP discovery on %d live hosts", len(live_hosts))
-            config["snmp_community"] = snmp_community or config.get("snmp_community", "public")
             config["snmp_timeout"] = timeout
 
             lock = threading.Lock()

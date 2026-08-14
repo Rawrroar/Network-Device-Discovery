@@ -6,6 +6,8 @@ from unittest.mock import patch
 from nautobot_plugin_device_auto_discovery import snmp_tables
 from nautobot_plugin_device_auto_discovery.mappings import lookup_interface_type
 from nautobot_plugin_device_auto_discovery.snmp_tables import (
+    _auth_data,
+    build_snmp_auth,
     collect_arp_table,
     collect_cdp_neighbors,
     collect_interfaces,
@@ -367,6 +369,124 @@ class CollectSystemTests(TestCase):
         self.assertEqual(system["sys_name"], "switch-001")
         self.assertEqual(system["sys_contact"], "noc@example.com")
         self.assertEqual(system["sys_location"], "DC1 Row 3")
+
+
+def _fake_api():
+    """Minimal stand-in for the pysnmp API dict used by _auth_data."""
+    return {
+        "CommunityData": lambda *a, **k: ("community", a, k),
+        "UsmUserData": lambda *a, **k: ("usm", a, k),
+    }
+
+
+class SNMPv3AuthTests(TestCase):
+    def test_build_snmp_auth_defaults_to_v2c(self):
+        auth = build_snmp_auth({"snmp_community": "secret"})
+        self.assertEqual(auth["version"], 2)
+        self.assertEqual(auth["community"], "secret")
+        self.assertEqual(auth["context"], "")
+
+    def test_build_snmp_auth_explicit_v1(self):
+        auth = build_snmp_auth({"snmp_version": "1", "snmp_community": "ro"})
+        self.assertEqual(auth["version"], 1)
+
+    def test_build_snmp_auth_v3(self):
+        auth = build_snmp_auth(
+            {
+                "snmp_version": "3",
+                "snmpv3_username": "discover",
+                "snmpv3_auth_protocol": "SHA-256",
+                "snmpv3_auth_key": "auth-pass",
+                "snmpv3_priv_protocol": "AES-192",
+                "snmpv3_priv_key": "priv-pass",
+                "snmpv3_context_name": "ctx-1",
+            }
+        )
+        self.assertEqual(auth["version"], 3)
+        self.assertEqual(auth["user"], "discover")
+        self.assertEqual(auth["auth_protocol"], "SHA-256")
+        self.assertEqual(auth["priv_protocol"], "AES-192")
+        self.assertEqual(auth["context"], "ctx-1")
+
+    def test_auth_data_uses_community_for_v2c(self):
+        result = _auth_data(_fake_api(), build_snmp_auth({"snmp_community": "public"}))
+        self.assertEqual(result[0], "community")
+        self.assertEqual(result[1], ("public",))
+        self.assertEqual(result[2]["mpModel"], 1)
+
+    def test_auth_data_uses_community_for_v1(self):
+        result = _auth_data(_fake_api(), build_snmp_auth({"snmp_version": "1", "snmp_community": "ro"}))
+        self.assertEqual(result[2]["mpModel"], 0)
+
+    def test_auth_data_uses_usm_for_v3(self):
+        auth = build_snmp_auth(
+            {
+                "snmp_version": "3",
+                "snmpv3_username": "discover",
+                "snmpv3_auth_protocol": "SHA",
+                "snmpv3_auth_key": "auth-pass",
+                "snmpv3_priv_protocol": "AES",
+                "snmpv3_priv_key": "priv-pass",
+            }
+        )
+        result = _auth_data(_fake_api(), auth)
+        self.assertEqual(result[0], "usm")
+        self.assertEqual(result[1], ("discover",))
+        self.assertEqual(result[2]["authProtocol"], (1, 3, 6, 1, 6, 3, 10, 1, 1, 3))  # SHA
+        self.assertEqual(result[2]["privProtocol"], (1, 3, 6, 1, 6, 3, 10, 1, 2, 4))  # AES
+
+    def test_auth_data_noauth_nopriv_without_keys(self):
+        auth = build_snmp_auth({"snmp_version": "3", "snmpv3_username": "nopriv"})
+        result = _auth_data(_fake_api(), auth)
+        self.assertIsNone(result[2]["authProtocol"])
+        self.assertIsNone(result[2]["privProtocol"])
+        self.assertIsNone(result[2]["authKey"])
+        self.assertIsNone(result[2]["privKey"])
+
+    def test_auth_data_auth_only_without_priv_key(self):
+        auth = build_snmp_auth({"snmp_version": "3", "snmpv3_username": "u", "snmpv3_auth_key": "auth-pass"})
+        result = _auth_data(_fake_api(), auth)
+        self.assertIsNotNone(result[2]["authProtocol"])
+        self.assertIsNone(result[2]["privProtocol"])
+
+    def test_collect_system_passes_v3_auth_to_snmp_get(self):
+        captured = []
+
+        def fake_snmp_get(ip_str, oid, auth, timeout, retries):
+            captured.append((ip_str, oid, auth))
+            return "value"
+
+        config = dict(CONFIG)
+        config["snmp_version"] = "3"
+        config["snmpv3_username"] = "discover"
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.snmp_get",
+            side_effect=fake_snmp_get,
+        ):
+            collect_system("192.0.2.1", config)
+
+        self.assertTrue(captured)
+        self.assertEqual(captured[0][2]["version"], 3)
+        self.assertEqual(captured[0][2]["user"], "discover")
+
+    def test_discover_tables_uses_v3_auth_probe(self):
+        captured = {}
+
+        def fake_snmp_get(ip_str, oid, auth, timeout, retries):
+            captured["auth"] = auth
+            return None
+
+        config = dict(CONFIG)
+        config["snmp_version"] = "3"
+        config["snmpv3_username"] = "discover"
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.snmp_get",
+            side_effect=fake_snmp_get,
+        ):
+            discover_snmp_tables("192.0.2.1", config)
+
+        self.assertEqual(captured["auth"]["version"], 3)
+        self.assertEqual(captured["auth"]["user"], "discover")
 
 
 class DiscoverTablesTests(TestCase):

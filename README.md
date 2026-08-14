@@ -75,7 +75,14 @@ PLUGINS_CONFIG = {
         "create_missing_objects": True,
         "snmp_timeout": 3,
         "snmp_retries": 2,
+        "snmp_version": "2c",
         "snmp_community": "public",
+        "snmpv3_username": "",
+        "snmpv3_auth_protocol": "SHA",
+        "snmpv3_auth_key": "",
+        "snmpv3_priv_protocol": "AES",
+        "snmpv3_priv_key": "",
+        "snmpv3_context_name": "",
         "populate_interfaces": True,
         "populate_ip_addresses": True,
         "populate_vlans": True,
@@ -113,13 +120,23 @@ Finds live hosts in a CIDR range:
 
 ### SNMP Discovery
 
-Discovers devices via SNMP:
+Discovers devices via SNMP (v1, v2c, or v3):
 
 1. Navigate to **Jobs > SNMP Discovery**
 2. Enter target network
-3. Provide SNMP community string
+3. Select the SNMP version:
+   - **`2c` (default)** — provide the community string
+   - **`1`** — same community string, SNMPv1 message format
+   - **`3`** — provide the SNMPv3 USM username and, optionally, auth/priv
+     protocol and passphrase (noAuth/noPriv, authNoPriv, or authPriv are
+     selected automatically based on which keys are supplied) plus an
+     optional context name for v3B / context-engine-ID setups
 4. Optionally toggle **Populate interfaces**, **Populate IP addresses**, **Include neighbors**, and **Populate VLANs**
 5. Run the job
+
+SNMPv3 auth/priv passphrases are treated as sensitive inputs, so the job
+cannot be scheduled or run through an approval workflow. For automated runs,
+set `snmp_version` to `"3"` and the SNMPv3 fields in `PLUGINS_CONFIG` instead.
 
 Devices discovered via SNMP are auto-created in Nautobot. Platform identification is done via SNMP OID matching. Interfaces and IP addresses are created from the walked IF-MIB and IP-MIB tables; the Device serial number comes from ENTITY-MIB when available. VLANs are created from the Q-BRIDGE-MIB `dot1qVlanStaticTable` (ID + name) under a per-device `VLANGroup`. In dry-run mode, no objects are created but all walked table data is captured on the `DiscoveryResult` for review.
 
@@ -158,7 +175,7 @@ Runs all three methods in sequence:
 
 1. Navigate to **Jobs > Full Discovery**
 2. Enter target network
-3. Configure SNMP community, SSH credentials
+3. Configure SNMP version/community (or SNMPv3 USM credentials) and SSH credentials
 4. Toggle which methods to enable (ping / SNMP / SSH) and whether to populate interfaces, IP addresses, and VLANs
 5. Run the job
 
@@ -210,7 +227,14 @@ For SSH-discovered devices, vendor detection is done via keyword matching on com
 | `create_missing_objects` | `True` | Auto-create Manufacturer, DeviceType, Platform if missing |
 | `snmp_timeout` | `3` | SNMP query timeout in seconds |
 | `snmp_retries` | `2` | SNMP retry count |
-| `snmp_community` | `"public"` | Default SNMP community string |
+| `snmp_version` | `"2c"` | SNMP version: `"1"`, `"2c"`, or `"3"` (USM) |
+| `snmp_community` | `"public"` | Default SNMP community string (v1/v2c) |
+| `snmpv3_username` | `""` | SNMPv3 USM username |
+| `snmpv3_auth_protocol` | `"SHA"` | SNMPv3 auth protocol: `noAuth`, `MD5`, `SHA`, `SHA-256`, `SHA-384`, `SHA-512` |
+| `snmpv3_auth_key` | `""` | SNMPv3 auth passphrase |
+| `snmpv3_priv_protocol` | `"AES"` | SNMPv3 privacy protocol: `noPriv`, `DES`, `3DES`, `AES`, `AES-192`, `AES-256` |
+| `snmpv3_priv_key` | `""` | SNMPv3 privacy passphrase |
+| `snmpv3_context_name` | `""` | Optional SNMPv3 context name |
 | `populate_interfaces` | `True` | Create `dcim.Interface` objects from IF-MIB |
 | `populate_ip_addresses` | `True` | Create/assign `ipam.IPAddress` objects from IP-MIB |
 | `populate_vlans` | `True` | Create `ipam.VLAN` objects from Q-BRIDGE-MIB |

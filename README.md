@@ -19,6 +19,8 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - Configurable defaults for device location, role, status, and tags
 - Threaded/concurrent scanning for fast results
 - Dry-run mode for SNMP, SSH, and Full jobs
+- **Cable linking** — creates `dcim.Cable` objects from LLDP/CDP neighbor data when both ends can be resolved
+- **Crawl Discovery** — iteratively discovers devices from a seed device by following LLDP/CDP neighbors hop by hop
 - Compatible with Nautobot v3.x
 
 ### SNMP table collection
@@ -30,7 +32,8 @@ When a device responds to SNMP, the plugin walks common MIB tables and populates
 - **IP addresses (IP-MIB)** — creates `ipam.IPAddress` objects and assigns them to the matching interface
 - **VLANs (Q-BRIDGE-MIB)** — creates `ipam.VLAN` objects (ID + name) under a per-device `VLANGroup`
 - **Physical inventory (ENTITY-MIB)** — used to populate the Device `serial` number
-- **Neighbors (LLDP-MIB / CISCO-CDP-MIB)** — recorded on the `DiscoveryResult` (`neighbors_found`, `discovered_data`), not linked as Cables
+- **Neighbors (LLDP-MIB / CISCO-CDP-MIB)** — recorded on the `DiscoveryResult` (`neighbors_found`, `discovered_data`); when the remote management IP is available it is captured as `remote_ip`
+- **Cables** — the SNMP, Full, and Crawl jobs can link `dcim.Cable` objects between a local interface and the matching remote interface/device (matched by remote management IP or device name + port) whenever both ends are resolvable
 
 Raw walked tables are stored in `DiscoveryResult.discovered_data` so you can review exactly what was found, including in dry-run mode.
 
@@ -131,7 +134,7 @@ Discovers devices via SNMP (v1, v2c, or v3):
      protocol and passphrase (noAuth/noPriv, authNoPriv, or authPriv are
      selected automatically based on which keys are supplied) plus an
      optional context name for v3B / context-engine-ID setups
-4. Optionally toggle **Populate interfaces**, **Populate IP addresses**, **Include neighbors**, and **Populate VLANs**
+4. Optionally toggle **Populate interfaces**, **Populate IP addresses**, **Include neighbors**, **Populate VLANs**, and **Create cables**
 5. Run the job
 
 SNMPv3 auth/priv passphrases are treated as sensitive inputs, so the job
@@ -176,7 +179,7 @@ Runs all three methods in sequence:
 1. Navigate to **Jobs > Full Discovery**
 2. Enter target network
 3. Configure SNMP version/community (or SNMPv3 USM credentials) and SSH credentials
-4. Toggle which methods to enable (ping / SNMP / SSH) and whether to populate interfaces, IP addresses, and VLANs
+4. Toggle which methods to enable (ping / SNMP / SSH) and whether to populate interfaces, IP addresses, VLANs, and cables
 5. Run the job
 
 The job will:
@@ -185,6 +188,26 @@ The job will:
 3. Run SSH on hosts not identified by SNMP
 4. Deduplicate results
 5. Create devices in Nautobot
+6. Create `dcim.Cable` links from the LLDP/CDP neighbor data (when `create_cables` is enabled)
+
+### Crawl Discovery
+
+Discovers devices iteratively from a seed device using SNMP only:
+
+1. Navigate to **Jobs > Crawl Discovery**
+2. Select the **seed device** (a Nautobot `Device`); its primary IP is used, or provide a `seed_ip` override
+3. Configure `max_depth` (hops from the seed) and `max_devices` (visit cap)
+4. Configure SNMP version/community (or SNMPv3 USM credentials) and toggle populate/include flags, including `create_cables`
+5. Run the job
+
+The job performs a breadth-first crawl:
+1. Walk the seed device's LLDP/CDP neighbor tables via SNMP
+2. Create/update each discovered device and record a `DiscoveryResult`
+3. Resolve each neighbor's management IP (`remote_ip`, then reverse-DNS on the neighbor name, then an existing Device's primary IP)
+4. Continue crawling from each neighbor's IP, level by level, until `max_depth`, `max_devices`, or the visited set is exhausted
+5. Create `dcim.Cable` links from the collected neighbor data when `create_cables` is enabled
+
+A visited set (keyed on IP) plus the depth and device caps keep the crawl finite. The seed device does not need an SNMP walkable primary IP if `seed_ip` is provided.
 
 ### API Usage
 

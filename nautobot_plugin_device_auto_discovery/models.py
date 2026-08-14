@@ -14,13 +14,14 @@ class DiscoveryScan(PrimaryModel):
         SNMP = "snmp", "SNMP Discovery"
         SSH = "ssh", "SSH Discovery"
         FULL = "full", "Full Discovery (Ping + SNMP + SSH)"
+        CRAWL = "crawl", "Crawl Discovery (seed device + neighbors)"
 
     name = models.CharField(
         max_length=100,
         help_text="Display name for this scan.",
     )
     scan_method = models.CharField(
-        max_length=4,
+        max_length=10,
         choices=ScanMethod.choices,
         help_text="The discovery method used.",
     )
@@ -48,6 +49,18 @@ class DiscoveryScan(PrimaryModel):
     devices_created = models.PositiveIntegerField(
         default=0,
         help_text="Number of new Device objects created in Nautobot.",
+    )
+    cables_created = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of dcim.Cable objects created from neighbor data.",
+    )
+    seed_device = models.ForeignKey(
+        "dcim.Device",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="crawl_scans",
+        help_text="Seed device for crawl discovery scans.",
     )
     error_message = models.TextField(
         blank=True,

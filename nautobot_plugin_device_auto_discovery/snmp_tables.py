@@ -86,12 +86,15 @@ OID_LLDPREMCHASSISID = OID_LLDPREMTABLE + ".5"
 OID_LLDPREMPORTID = OID_LLDPREMTABLE + ".7"
 OID_LLDPREMSYSNAME = OID_LLDPREMTABLE + ".10"
 OID_LLDPREMSYSDESC = OID_LLDPREMTABLE + ".11"
+OID_LLDPREMMANADDRTABLE = "1.0.8802.1.1.2.1.4.2.1"  # lldpRemManAddrTable
+OID_LLDPREMMANADDR = OID_LLDPREMMANADDRTABLE + ".3"  # lldpRemManAddr
 
 # CISCO-CDP-MIB
 OID_CDPCACHETABLE = "1.3.6.1.4.1.9.9.23.1.2.1.1"
 OID_CDPCACHEDEVICEID = OID_CDPCACHETABLE + ".6"
 OID_CDPCACHEDEVICEPORT = OID_CDPCACHETABLE + ".7"
 OID_CDPCACHEPLATFORM = OID_CDPCACHETABLE + ".8"
+OID_CDPCACHEADDRESS = OID_CDPCACHETABLE + ".9"
 
 # Q-BRIDGE-MIB (RFC 4363) dot1qVlanStaticTable (index = dot1qVlanIndex / VLAN ID)
 OID_VLANSTATICTABLE = "1.3.6.1.2.1.17.7.1.4.2.1"
@@ -476,6 +479,46 @@ def mac_from_bytes(raw):
         return None
 
 
+def lldp_remote_ip_from_index(index):
+    """Parse a remote management address out of an lldpRemManAddr index.
+
+    Index format: ``<timeMark>.<localPortNum>.<lldpRemIndex>.<addrSubtype>.<addr octets>``
+    where addrSubtype 1 is IPv4 and 2 is IPv6. IPv6 octet indexes are not a
+    valid textual IPv6 form, so only IPv4 is parsed here.
+
+    Returns:
+        str IPv4 address, or "" if none can be parsed.
+    """
+    if not index:
+        return ""
+    parts = index.split(".")
+    if len(parts) < 5 or parts[3] != "1":
+        return ""
+    address = ".".join(parts[4:])
+    try:
+        return str(IPAddress(address))
+    except Exception:
+        return ""
+
+
+def cdp_address_to_ip(value):
+    """Convert a CDP cdpCacheAddress OctetString to an IPv4 string.
+
+    The value is an OctetString rendered by pysnmp as colon-separated hex
+    (e.g. ``"c0:a8:01:01"``). Returns "" when it is not a 4-octet IPv4.
+    """
+    if not value:
+        return ""
+    hexdigits = value.replace(":", "").replace("-", "").replace(".", "")
+    if len(hexdigits) != 8:
+        return ""
+    try:
+        octets = [int(hexdigits[i : i + 2], 16) for i in range(0, 8, 2)]
+    except ValueError:
+        return ""
+    return ".".join(str(octet) for octet in octets)
+
+
 def _if_type_name(code, speed=None):
     """Map a numeric IANA ifType to a Nautobot InterfaceTypeChoices value."""
     return lookup_interface_type(code, speed)
@@ -749,6 +792,19 @@ def collect_lldp_neighbors(ip_str, config, max_rows=1000):
     sysdesc_map = walk_columns(ip_str, OID_LLDPREMSYSDESC, auth, timeout, retries, max_rows)
     chassis_map = walk_columns(ip_str, OID_LLDPREMCHASSISID, auth, timeout, retries, max_rows)
 
+    # Remote management addresses; the man-addr index prefixes the lldpRem
+    # index (<timeMark>.<localPortNum>.<lldpRemIndex>) with an address subtype
+    # and the address octets.
+    manaddr_map = walk_columns(ip_str, OID_LLDPREMMANADDR, auth, timeout, retries, max_rows)
+    remote_ip_by_key = {}
+    for index, _value in manaddr_map.items():
+        parts = index.split(".")
+        if len(parts) < 5:
+            continue
+        address = lldp_remote_ip_from_index(index)
+        if address:
+            remote_ip_by_key.setdefault(".".join(parts[:3]), address)
+
     neighbors = []
     for index, sys_name in sysname_map.items():
         # lldpRem index format: <timeMark>.<localPortNum>.<lldpRemIndex>
@@ -764,7 +820,7 @@ def collect_lldp_neighbors(ip_str, config, max_rows=1000):
                 "remote_name": sys_name,
                 "remote_port": port_id_map.get(index, ""),
                 "remote_description": sysdesc_map.get(index, ""),
-                "remote_ip": "",
+                "remote_ip": remote_ip_by_key.get(index, ""),
                 "remote_chassis_id": chassis_map.get(index, ""),
             }
         )
@@ -788,6 +844,18 @@ def collect_cdp_neighbors(ip_str, config, max_rows=1000):
     port_map = walk_columns(ip_str, OID_CDPCACHEDEVICEPORT, auth, timeout, retries, max_rows)
     platform_map = walk_columns(ip_str, OID_CDPCACHEPLATFORM, auth, timeout, retries, max_rows)
 
+    # CDP neighbor addresses; the index is <ifIndex>.<cdpCacheDeviceIndex>.<addrType>
+    # where addrType 3 is an IPv4 address whose value is a 4-octet OctetString.
+    addr_map = walk_columns(ip_str, OID_CDPCACHEADDRESS, auth, timeout, retries, max_rows)
+    remote_ip_by_key = {}
+    for index, value in addr_map.items():
+        parts = index.split(".")
+        if len(parts) < 3 or parts[2] != "3":
+            continue
+        address = cdp_address_to_ip(value)
+        if address:
+            remote_ip_by_key.setdefault(".".join(parts[:2]), address)
+
     neighbors = []
     for index, device_id in device_map.items():
         # cdpCache index format: <ifIndex>.<cdpCacheDeviceIndex>
@@ -801,7 +869,7 @@ def collect_cdp_neighbors(ip_str, config, max_rows=1000):
                 "remote_name": device_id,
                 "remote_port": port_map.get(index, ""),
                 "remote_description": platform_map.get(index, ""),
-                "remote_ip": "",
+                "remote_ip": remote_ip_by_key.get(index, ""),
                 "remote_chassis_id": "",
             }
         )

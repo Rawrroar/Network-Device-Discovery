@@ -1459,6 +1459,7 @@ class SNMPDiscoveryJob(Job):
         failed = 0
         existing = 0
         conflicts = 0
+        errors = []
         lock = threading.Lock()
 
         def scan_and_create(ip):
@@ -1503,6 +1504,7 @@ class SNMPDiscoveryJob(Job):
             except Exception as exc:
                 with lock:
                     failed += 1
+                    errors.append(f"{ip_str}: {exc!r}")
                 self.logger.error("SNMP scan error for %s: %s", ip_str, exc)
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
@@ -1540,6 +1542,7 @@ class SNMPDiscoveryJob(Job):
             "conflicts": conflicts,
             "failed": failed,
             "cables_created": cables_created,
+            "errors": errors[:10],
         }
 
 

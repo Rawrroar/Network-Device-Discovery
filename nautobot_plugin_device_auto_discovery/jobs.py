@@ -1330,6 +1330,7 @@ class SNMPDiscoveryJob(Job):
     )
     snmpv3_username = StringVar(
         default="",
+        required=False,
         description="SNMPv3 USM username (used when snmp_version is '3').",
     )
     snmpv3_auth_protocol = StringVar(
@@ -1338,6 +1339,7 @@ class SNMPDiscoveryJob(Job):
     )
     snmpv3_auth_key = StringVar(
         default="",
+        required=False,
         description="SNMPv3 authentication passphrase. Sensitive; do not schedule or approve runs.",
     )
     snmpv3_priv_protocol = StringVar(
@@ -1346,10 +1348,12 @@ class SNMPDiscoveryJob(Job):
     )
     snmpv3_priv_key = StringVar(
         default="",
+        required=False,
         description="SNMPv3 privacy/encryption passphrase. Sensitive; do not schedule or approve runs.",
     )
     snmpv3_context_name = StringVar(
         default="",
+        required=False,
         description="Optional SNMPv3 context name (for v3B / context-engine-ID setups).",
     )
     timeout = IntegerVar(
@@ -2038,6 +2042,7 @@ class FullDiscoveryJob(Job):
     )
     snmpv3_username = StringVar(
         default="",
+        required=False,
         description="SNMPv3 USM username (used when snmp_version is '3').",
     )
     snmpv3_auth_protocol = StringVar(
@@ -2046,6 +2051,7 @@ class FullDiscoveryJob(Job):
     )
     snmpv3_auth_key = StringVar(
         default="",
+        required=False,
         description="SNMPv3 authentication passphrase. Sensitive; do not schedule or approve runs.",
     )
     snmpv3_priv_protocol = StringVar(
@@ -2054,10 +2060,12 @@ class FullDiscoveryJob(Job):
     )
     snmpv3_priv_key = StringVar(
         default="",
+        required=False,
         description="SNMPv3 privacy/encryption passphrase. Sensitive; do not schedule or approve runs.",
     )
     snmpv3_context_name = StringVar(
         default="",
+        required=False,
         description="Optional SNMPv3 context name (for v3B / context-engine-ID setups).",
     )
     ssh_username = StringVar(
@@ -2423,6 +2431,7 @@ class CrawlDiscoveryJob(Job):
     )
     snmpv3_username = StringVar(
         default="",
+        required=False,
         description="SNMPv3 USM username (used when snmp_version is '3').",
     )
     snmpv3_auth_protocol = StringVar(
@@ -2431,6 +2440,7 @@ class CrawlDiscoveryJob(Job):
     )
     snmpv3_auth_key = StringVar(
         default="",
+        required=False,
         description="SNMPv3 authentication passphrase. Sensitive; do not schedule or approve runs.",
     )
     snmpv3_priv_protocol = StringVar(
@@ -2439,10 +2449,12 @@ class CrawlDiscoveryJob(Job):
     )
     snmpv3_priv_key = StringVar(
         default="",
+        required=False,
         description="SNMPv3 privacy/encryption passphrase. Sensitive; do not schedule or approve runs.",
     )
     snmpv3_context_name = StringVar(
         default="",
+        required=False,
         description="Optional SNMPv3 context name (for v3B / context-engine-ID setups).",
     )
     timeout = IntegerVar(

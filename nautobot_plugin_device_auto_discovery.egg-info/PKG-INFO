@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: nautobot-plugin-device-auto-discovery
-Version: 0.3.2
+Version: 0.3.3
 Summary: A Nautobot plugin for automatic network device discovery via ICMP, SNMP, and SSH.
 Author-email: Developer <dev@example.com>
 License: Apache-2.0

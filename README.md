@@ -21,6 +21,8 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - Dry-run mode for SNMP, SSH, and Full jobs
 - **Cable linking** — creates `dcim.Cable` objects from LLDP/CDP neighbor data when both ends can be resolved
 - **Crawl Discovery** — iteratively discovers devices from a seed device by following LLDP/CDP neighbors hop by hop
+- **DiscoveryProfiles** — reusable scan-scope and settings (prefixes, exclusions, IP cap, ports, timeouts, domain stripping) applied to the SNMP, Full, and Crawl jobs
+- **Inventory correlation** — each discovered IP is matched against Nautobot by primary IP, hostname, and serial, and persisted on a `DiscoveredDevice` record as `imported`, `new`, `partially_imported`, or `conflict`
 - Compatible with Nautobot v3.x
 
 ### SNMP table collection
@@ -208,6 +210,32 @@ The job performs a breadth-first crawl:
 5. Create `dcim.Cable` links from the collected neighbor data when `create_cables` is enabled
 
 A visited set (keyed on IP) plus the depth and device caps keep the crawl finite. The seed device does not need an SNMP walkable primary IP if `seed_ip` is provided.
+
+### DiscoveryProfiles
+
+`DiscoveryProfile` records provide a reusable bundle of scan scope and settings that the SNMP, Full, and Crawl jobs accept via a **Profile** job input:
+
+- `included_ip_prefixes` — CIDR prefixes to scan (used instead of the `target_network` input when present)
+- `excluded_ip_prefixes` — CIDR prefixes to skip
+- `maximum_ip_addresses` — hard cap on the number of hosts scanned (0 = unlimited); the job aborts with an error when exceeded
+- `protocols` — which methods to use (`ping`, `snmp`, `ssh`)
+- `ssh_port` / `snmp_port` / `snmp_timeout` / `snmp_retries` — transport settings (profile values take precedence over job defaults)
+- `snmpv3_auth_protocol` / `snmpv3_priv_protocol` — default SNMPv3 algorithms
+- `fast_path` — reserved for the fast-path optimization
+- `strip_domain_suffixes` — domain suffixes stripped from discovered hostnames (case-insensitive, longest match wins, dot boundary required)
+
+### Inventory Correlation
+
+Every discovered IP is recorded as a persistent `DiscoveredDevice` row and matched against the Nautobot inventory using three identifying attributes:
+
+| Correlation status | Meaning |
+|--------------------|---------|
+| `imported` | Exactly one device matches and all known attributes (primary IP, hostname, serial) agree — no changes made |
+| `new` | No matching device exists — auto-created in Nautobot by default |
+| `partially_imported` | Exactly one device matches but some attributes differ (e.g. new serial) — flagged for review, not auto-created |
+| `conflict` | More than one device matches — flagged for review, not auto-created |
+
+The **Create devices** job input controls auto-creation: when disabled (e.g. profile review mode), `new` devices are recorded but not created. Correlation statuses are persisted on the `DiscoveredDevice` record and mirrored onto the `DiscoveryResult` (`new` / `existing` / `partial` / `conflict`).
 
 ### API Usage
 

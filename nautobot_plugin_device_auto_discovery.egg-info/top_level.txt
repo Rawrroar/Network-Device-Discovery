@@ -1,2 +1,4 @@
+build
+dist
 nautobot_plugin_device_auto_discovery
 tests

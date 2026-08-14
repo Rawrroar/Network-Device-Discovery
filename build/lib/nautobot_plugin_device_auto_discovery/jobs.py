@@ -9,10 +9,14 @@ import re
 import socket
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import netaddr
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.utils import timezone
 from netaddr import IPNetwork, IPAddress
 
 from nautobot.apps.jobs import (
@@ -27,7 +31,9 @@ from nautobot.apps.jobs import (
     StringVar,
     TextVar,
 )
+from nautobot.dcim.choices import CableTypeChoices
 from nautobot.dcim.models import (
+    Cable,
     Device,
     DeviceType,
     Interface,
@@ -40,10 +46,12 @@ from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
 from nautobot.ipam.models import IPAddress, Namespace, Prefix, VLAN, VLANGroup
 
-from .models import DiscoveryScan, DiscoveryResult
+from .models import DiscoveryProfile, DiscoveryResult, DiscoveryScan, DiscoveredDevice
+from .correlation import correlate_device
 from .mappings import lookup_platform_from_oid
 from .snmp_tables import discover_snmp_tables, find_chassis_model, find_chassis_serial, snmp_get
 from .ssh_profiles import SSH_PROFILES, GENERIC_INFO_COMMANDS
+from .utils import strip_domain_suffixes
 
 # Common SNMP constants kept for backward compatibility
 from .snmp_tables import (
@@ -411,6 +419,424 @@ def create_device_in_nautobot(
     except Exception as exc:
         logger.error("Failed to create device %s: %s", hostname, exc)
         return None, "failed", str(exc)
+
+
+# ------------------------------------------------------------------ #
+#  Neighbor linking & cable creation                                  #
+# ------------------------------------------------------------------ #
+
+
+def get_cable_status():
+    """Return the 'Connected' Status usable for dcim.Cable, else the first."""
+    return Status.objects.get_for_model(Cable).filter(name="Connected").first() or Status.objects.get_for_model(
+        Cable
+    ).first()
+
+
+def _find_device_by_neighbor_name(remote_name):
+    """Find a Device matching an LLDP/CDP neighbor sysName.
+
+    Tries an exact case-insensitive match first, then the short
+    (domain-stripped) name. Returns None when nothing matches.
+    """
+    if not remote_name:
+        return None
+    device = Device.objects.filter(name__iexact=remote_name).first()
+    if device:
+        return device
+    short_name = remote_name.split(".")[0]
+    if short_name and short_name != remote_name:
+        return Device.objects.filter(name__iexact=short_name).first()
+    return None
+
+
+def _find_interface_by_ip(ip_str):
+    """Find an Interface owning the given IP address, when assigned."""
+    if not ip_str:
+        return None
+    try:
+        netaddr.IPAddress(ip_str)
+    except Exception:
+        return None
+    ip_obj = IPAddress.objects.filter(address__startswith=f"{ip_str}/").first()
+    if ip_obj and isinstance(ip_obj.assigned_object, Interface):
+        return ip_obj.assigned_object
+    return None
+
+
+def _resolve_remote_interface(neighbor):
+    """Resolve the far-end Interface of an LLDP/CDP neighbor row.
+
+    Priority: by the neighbor's management IP (when it is assigned to an
+    interface), then by remote device name + remote port name.
+
+    Returns:
+        Interface or None when the far end cannot be resolved.
+    """
+    remote_ip = neighbor.get("remote_ip") or ""
+    if remote_ip:
+        iface = _find_interface_by_ip(remote_ip)
+        if iface:
+            return iface
+
+    device = _find_device_by_neighbor_name(neighbor.get("remote_name") or "")
+    if not device:
+        return None
+    remote_port = neighbor.get("remote_port") or ""
+    if not remote_port:
+        return None
+    for candidate in (remote_port, remote_port.replace(" ", "")):
+        iface = device.interfaces.filter(name__iexact=candidate).first()
+        if iface:
+            return iface
+    return None
+
+
+def _build_interface_index_map(device, interfaces_data):
+    """Map SNMP ifIndex -> Interface for a device, from stored walk data."""
+    index_map = {}
+    for row in interfaces_data:
+        index = str(row.get("index") or "")
+        name = (row.get("name") or "").strip()
+        if not index or not name:
+            continue
+        iface = device.interfaces.filter(name__iexact=name).first()
+        if iface:
+            index_map[index] = iface
+    return index_map
+
+
+def link_neighbors_to_cables(scan, config):
+    """Create dcim.Cable objects from the LLDP/CDP neighbors in a scan.
+
+    Idempotent: existing terminations are matched first, and any endpoint
+    that is already cabled (or cannot be resolved) is skipped.
+
+    Returns:
+        int number of cables created.
+    """
+    if not config.get("create_cables", True):
+        return 0
+
+    status = get_cable_status()
+    if not status:
+        logger.warning("No Status available for dcim.Cable; skipping cable linking.")
+        return 0
+
+    cable_type = None
+    type_name = str(config.get("cable_type", "copper")).upper()
+    if type_name in CableTypeChoices:
+        cable_type = CableTypeChoices[type_name].value
+
+    interface_content_type = ContentType.objects.get_for_model(Interface)
+    created = 0
+    skipped = 0
+
+    results = scan.results.filter(nautobot_device__isnull=False)
+    for result in results.select_related("nautobot_device"):
+        device = result.nautobot_device
+        data = result.discovered_data or {}
+        neighbors = data.get("neighbors") or []
+        if not neighbors:
+            continue
+        iface_map = _build_interface_index_map(device, data.get("interfaces") or [])
+
+        for neighbor in neighbors:
+            local_iface = iface_map.get(str(neighbor.get("local_if_index") or ""))
+            if not local_iface:
+                skipped += 1
+                continue
+            if getattr(local_iface, "cable", None) is not None:
+                skipped += 1
+                continue
+            remote_iface = _resolve_remote_interface(neighbor)
+            if not remote_iface or remote_iface.pk == local_iface.pk:
+                skipped += 1
+                continue
+            if getattr(remote_iface, "cable", None) is not None:
+                skipped += 1
+                continue
+
+            a_pk, b_pk = sorted((local_iface.pk, remote_iface.pk))
+            defaults = {
+                "status": status,
+                "label": f"auto-discovery {scan.name}",
+            }
+            if cable_type:
+                defaults["type"] = cable_type
+            try:
+                _cable, was_created = Cable.objects.get_or_create(
+                    termination_a_type=interface_content_type,
+                    termination_a_id=a_pk,
+                    termination_b_type=interface_content_type,
+                    termination_b_id=b_pk,
+                    defaults=defaults,
+                )
+            except Exception as exc:
+                logger.debug("Cable linking failed %s <-> %s: %s", local_iface, remote_iface, exc)
+                skipped += 1
+                continue
+            if was_created:
+                created += 1
+            else:
+                skipped += 1
+
+    logger.info("Cable linking complete for scan %s: %d created, %d skipped", scan, created, skipped)
+    return created
+
+
+def neighbor_management_ip(neighbor):
+    """Resolve the management IP of a neighbor for continuing a crawl.
+
+    Priority: remote management IP from the SNMP walk, then reverse-DNS on
+    the neighbor name, then the primary IP of an existing Nautobot Device
+    with the same name.
+
+    Returns:
+        str IP address, or None when no address can be resolved.
+    """
+    remote_ip = neighbor.get("remote_ip") or ""
+    if remote_ip:
+        try:
+            netaddr.IPAddress(remote_ip)
+            return remote_ip
+        except Exception:
+            pass
+
+    remote_name = neighbor.get("remote_name") or ""
+    if not remote_name:
+        return None
+    try:
+        resolved = socket.gethostbyname(remote_name)
+        if resolved:
+            return resolved
+    except (socket.error, OSError):
+        pass
+
+    device = Device.objects.filter(name__iexact=remote_name).first()
+    if device and device.primary_ip4:
+        return str(device.primary_ip4.address.ip)
+    return None
+
+
+# ------------------------------------------------------------------ #
+#  DiscoveryProfile + correlation helpers                              #
+# ------------------------------------------------------------------ #
+
+
+def apply_profile(config, profile):
+    """Merge a DiscoveryProfile into the runtime config.
+
+    Profile values take precedence over job-level defaults; job-level
+    vars that carry explicit user input (credentials, version, etc.) are
+    left untouched.
+    """
+    if not profile:
+        return
+    config["profile"] = profile
+    if profile.included_ip_prefixes:
+        config["target_networks"] = list(profile.included_ip_prefixes)
+    config["profile_protocols"] = list(profile.protocols or [])
+    config["ssh_port"] = profile.ssh_port or config.get("ssh_port", 22)
+    config["snmp_port"] = profile.snmp_port or config.get("snmp_port", 161)
+    config["profile_snmp_timeout"] = profile.snmp_timeout
+    config["snmp_timeout"] = profile.snmp_timeout or config.get("snmp_timeout", 5)
+    config["snmp_retries"] = profile.snmp_retries
+    config["fast_path"] = bool(profile.fast_path)
+    if profile.snmpv3_auth_protocol:
+        config["snmpv3_auth_protocol"] = profile.snmpv3_auth_protocol
+    if profile.snmpv3_priv_protocol:
+        config["snmpv3_priv_protocol"] = profile.snmpv3_priv_protocol
+    if profile.strip_domain_suffixes:
+        config["strip_domain_suffixes"] = list(profile.strip_domain_suffixes)
+
+
+def _resolve_networks(target_network, profile=None):
+    """Return ``(networks, excluded)`` for the scan.
+
+    Profile included prefixes (minus exclusions) win over a single
+    ``target_network``. Invalid prefixes are skipped.
+    """
+    networks = []
+    excluded = []
+
+    prefixes = []
+    if profile and profile.included_ip_prefixes:
+        prefixes = list(profile.included_ip_prefixes)
+    elif target_network:
+        prefixes = [str(target_network)]
+
+    for prefix in prefixes:
+        try:
+            networks.append(IPNetwork(prefix))
+        except (ValueError, TypeError, netaddr.core.AddrFormatError):
+            continue
+
+    if profile and profile.excluded_ip_prefixes:
+        for prefix in profile.excluded_ip_prefixes:
+            try:
+                excluded.append(IPNetwork(prefix))
+            except (ValueError, TypeError, netaddr.core.AddrFormatError):
+                continue
+
+    return networks, excluded
+
+
+def _expanded_hosts(networks, excluded):
+    """Expand ``networks`` into a list of host strings, minus exclusions."""
+    hosts = []
+    for network in networks:
+        for ip in network:
+            if any(ip in exclusion for exclusion in excluded):
+                continue
+            hosts.append(str(ip))
+    return hosts
+
+
+def _correlation_status_for(result_status):
+    """Map a DiscoveryResult status to a DiscoveredDevice correlation status."""
+    return {
+        "existing": DiscoveredDevice.CorrelationStatus.IMPORTED,
+        "new": DiscoveredDevice.CorrelationStatus.NEW,
+        "partial": DiscoveredDevice.CorrelationStatus.PARTIALLY_IMPORTED,
+        "conflict": DiscoveredDevice.CorrelationStatus.CONFLICT,
+        "failed": DiscoveredDevice.CorrelationStatus.FAILED,
+    }.get(result_status, DiscoveredDevice.CorrelationStatus.NEW)
+
+
+def _result_discovered_data(info, method):
+    """Extract the subset of discovered data worth persisting."""
+    if method == "ssh":
+        return {"command_outputs": info.get("command_outputs", {})}
+    return {
+        "interfaces": info.get("interfaces", []),
+        "ip_addresses": info.get("ip_addresses", []),
+        "arp_table": info.get("arp_table", []),
+        "physical": info.get("physical", []),
+        "neighbors": info.get("neighbors", []),
+        "vlans": info.get("vlans", []),
+    }
+
+
+def upsert_discovered_device(ip_str, info, method, config, *, device, result_status, error, scan):
+    """Create or update the persistent per-IP DiscoveredDevice record."""
+    now = timezone.now()
+    platform_info = info.get("platform_info") or {}
+    is_snmp = method == "snmp"
+    collection_issue = error if result_status == "failed" else ""
+
+    defaults = {
+        "hostname": info.get("hostname", ""),
+        "vendor": info.get("vendor", ""),
+        "model": info.get("model", ""),
+        "device_type": info.get("model", ""),
+        "serial": info.get("serial", ""),
+        "os_version": info.get("os_version", ""),
+        "network_driver": platform_info.get("network_driver", ""),
+        "status": _correlation_status_for(result_status),
+        "device": device,
+        "last_seen": now,
+        "last_scan": scan,
+        "discovered_data": _result_discovered_data(info, method),
+    }
+    if is_snmp:
+        defaults["snmp_collection"] = True
+        defaults["snmp_collection_datetime"] = now
+        defaults["snmp_collection_attempt_datetime"] = now
+        defaults["snmp_issue"] = collection_issue
+        defaults["snmp_port"] = config.get("snmp_port")
+    else:
+        defaults["ssh_collection"] = True
+        defaults["ssh_collection_datetime"] = now
+        defaults["ssh_collection_attempt_datetime"] = now
+        defaults["ssh_issue"] = collection_issue
+        defaults["ssh_port"] = config.get("ssh_port")
+
+    return DiscoveredDevice.objects.update_or_create(ip_address=ip_str, defaults=defaults)[0]
+
+
+def finalize_discovery(scan, ip_str, method, info, config, *, auto_create=True, dryrun=False):
+    """Correlate, (optionally) auto-create, and record a discovered device.
+
+    Returns a 4-tuple ``(result_status, device, error, created_now)``.
+    """
+    info = dict(info or {})
+    info["hostname"] = strip_domain_suffixes(
+        info.get("hostname", ""), config.get("strip_domain_suffixes") or []
+    )
+    hostname = info["hostname"]
+    serial = info.get("serial", "")
+
+    corr = correlate_device(ip_str, hostname, serial)
+    created_now = False
+
+    if dryrun:
+        result_status = "existing" if corr["status"] == "imported" else "new"
+        device = None
+        error = "Dry-run: device discovered but not created"
+    elif corr["status"] == "imported":
+        result_status = "existing"
+        device = corr["device"]
+        error = ""
+    elif corr["status"] == "new":
+        if auto_create:
+            device, result_status, error = create_device_in_nautobot(
+                hostname,
+                ip_str,
+                info.get("vendor", ""),
+                info.get("model", ""),
+                serial,
+                info.get("os_version", ""),
+                info.get("platform_info"),
+                config,
+                scan,
+                info if method == "snmp" else None,
+            )
+            created_now = result_status == "new" and device is not None
+        else:
+            device = None
+            result_status = "new"
+            error = "Auto-create disabled (profile review mode)"
+    else:
+        result_status = corr["status"]
+        device = corr["device"]
+        error = f"Correlation {corr['status']}: device not auto-created; flagged for review"
+
+    upsert_discovered_device(
+        ip_str,
+        info,
+        method,
+        config,
+        device=device,
+        result_status=result_status,
+        error=error,
+        scan=scan,
+    )
+
+    platform_info = info.get("platform_info") or {}
+    DiscoveryResult.objects.create(
+        scan=scan,
+        ip_address=ip_str,
+        hostname=hostname,
+        vendor=info.get("vendor", ""),
+        model=info.get("model", ""),
+        serial_number=serial,
+        os_version=info.get("os_version", ""),
+        platform_name=platform_info.get("platform_name", "") if platform_info else "",
+        discovery_method=method,
+        result_status=result_status,
+        nautobot_device=device,
+        sys_location=info.get("sys_location", ""),
+        sys_contact=info.get("sys_contact", ""),
+        interfaces_found=info.get("interfaces_found", 0),
+        ip_addresses_found=info.get("ip_addresses_found", 0),
+        neighbors_found=info.get("neighbors_found", 0),
+        vlans_found=info.get("vlans_found", 0),
+        discovered_data=_result_discovered_data(info, method),
+        error_message=error,
+    )
+
+    return result_status, device, error, created_now
 
 
 def safe_icmp_ping(ip_str, timeout=2):
@@ -958,9 +1384,22 @@ class SNMPDiscoveryJob(Job):
         default=True,
         description="Create ipam.VLAN objects from the Q-BRIDGE-MIB table.",
     )
+    create_cables = BooleanVar(
+        default=True,
+        description="Create dcim.Cable objects from LLDP/CDP neighbor data when both ends can be resolved.",
+    )
+    profile = ObjectVar(
+        model=DiscoveryProfile,
+        required=False,
+        description="Optional DiscoveryProfile supplying scan scope and settings.",
+    )
+    create_devices = BooleanVar(
+        default=True,
+        description="Create new Nautobot Device objects for discovered devices without an existing match.",
+    )
     dryrun = DryRunVar()
 
-    def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, include_vlans=True, populate_vlans=True, dryrun=False):
+    def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False):
         config = get_plugin_config()
         snmp_version = str(snmp_version or "2c").strip().lower()
         if snmp_version.startswith("v"):
@@ -986,9 +1425,24 @@ class SNMPDiscoveryJob(Job):
         config["include_neighbors"] = include_neighbors
         config["include_vlans"] = include_vlans
         config["populate_vlans"] = populate_vlans
+        config["create_cables"] = create_cables
 
-        network = IPNetwork(target_network)
+        apply_profile(config, profile)
+
+        networks, excluded = _resolve_networks(target_network, profile)
+        if not networks:
+            self.logger.error("No valid target networks to scan (profile or target_network required).")
+            return {"error": "No valid target networks to scan"}
+        network = networks[0]
         scan_name = f"SNMP Scan: {network}"
+
+        hosts = _expanded_hosts(networks, excluded)
+        if profile and profile.maximum_ip_addresses and len(hosts) > profile.maximum_ip_addresses:
+            self.logger.error(
+                "Profile %s exceeds maximum_ip_addresses (%d > %d).",
+                profile.name, len(hosts), profile.maximum_ip_addresses,
+            )
+            return {"error": f"Profile {profile.name} exceeds maximum_ip_addresses ({profile.maximum_ip_addresses})"}
 
         discovery_scan = DiscoveryScan.objects.create(
             name=scan_name,
@@ -997,17 +1451,18 @@ class SNMPDiscoveryJob(Job):
             status="running",
         )
 
-        total = len(list(network))
+        total = len(hosts)
         self.logger.info("Starting SNMP discovery of %s (%d hosts)", network, total)
 
         discovered = 0
         created = 0
         failed = 0
         existing = 0
+        conflicts = 0
         lock = threading.Lock()
 
         def scan_and_create(ip):
-            nonlocal discovered, created, failed, existing
+            nonlocal discovered, created, failed, existing, conflicts
             ip_str = str(ip)
             try:
                 info = snmp_discover_device(ip_str, config)
@@ -1017,62 +1472,25 @@ class SNMPDiscoveryJob(Job):
                 with lock:
                     discovered += 1
 
-                if dryrun:
-                    device = None
-                    result_status = "new"
-                    error = "Dry-run: device discovered but not created"
-                else:
-                    device, result_status, error = create_device_in_nautobot(
-                        info["hostname"],
-                        ip_str,
-                        info["vendor"],
-                        info["model"],
-                        info["serial"],
-                        info["os_version"],
-                        info["platform_info"],
-                        config,
-                        discovery_scan,
-                        info,
-                    )
-
-                # Record result
-                DiscoveryResult.objects.create(
-                    scan=discovery_scan,
-                    ip_address=ip_str,
-                    hostname=info["hostname"],
-                    vendor=info["vendor"],
-                    model=info["model"],
-                    serial_number=info["serial"],
-                    os_version=info["os_version"],
-                    platform_name=info["platform_info"]["platform_name"] if info["platform_info"] else "",
-                    discovery_method="snmp",
-                    result_status=result_status,
-                    nautobot_device=device,
-                    sys_location=info.get("sys_location", ""),
-                    sys_contact=info.get("sys_contact", ""),
-                    interfaces_found=info.get("interfaces_found", 0),
-                    ip_addresses_found=info.get("ip_addresses_found", 0),
-                    neighbors_found=info.get("neighbors_found", 0),
-                    vlans_found=info.get("vlans_found", 0),
-                    discovered_data={
-                        "interfaces": info.get("interfaces", []),
-                        "ip_addresses": info.get("ip_addresses", []),
-                        "arp_table": info.get("arp_table", []),
-                        "physical": info.get("physical", []),
-                        "neighbors": info.get("neighbors", []),
-                        "vlans": info.get("vlans", []),
-                    },
-                    error_message=error,
+                result_status, device, error, created_now = finalize_discovery(
+                    discovery_scan,
+                    ip_str,
+                    "snmp",
+                    info,
+                    config,
+                    auto_create=create_devices,
+                    dryrun=dryrun,
                 )
 
                 with lock:
-                    if result_status == "new":
-                        if not dryrun:
-                            created += 1
+                    if created_now:
+                        created += 1
                     elif result_status == "existing":
                         existing += 1
                     elif result_status == "failed":
                         failed += 1
+                    elif result_status in ("partial", "conflict"):
+                        conflicts += 1
 
                 self.logger.info(
                     "SNMP: %s -> %s (%s)%s",
@@ -1087,7 +1505,6 @@ class SNMPDiscoveryJob(Job):
                     failed += 1
                 self.logger.error("SNMP scan error for %s: %s", ip_str, exc)
 
-        hosts = list(network)
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = {executor.submit(scan_and_create, host): host for host in hosts}
             for i, future in enumerate(as_completed(futures), 1):
@@ -1098,14 +1515,19 @@ class SNMPDiscoveryJob(Job):
                 except Exception:
                     pass
 
+        cables_created = 0
+        if config.get("create_cables", True):
+            cables_created = link_neighbors_to_cables(discovery_scan, config)
+
         discovery_scan.devices_discovered = discovered
         discovery_scan.devices_created = created
+        discovery_scan.cables_created = cables_created
         discovery_scan.status = "completed"
         discovery_scan.save()
 
         self.logger.info(
-            "SNMP discovery complete: %d discovered, %d created, %d existing, %d failed",
-            discovered, created, existing, failed,
+            "SNMP discovery complete: %d discovered, %d created, %d existing, %d conflicts, %d failed",
+            discovered, created, existing, conflicts, failed,
         )
 
         return {
@@ -1115,7 +1537,9 @@ class SNMPDiscoveryJob(Job):
             "discovered": discovered,
             "created": created,
             "existing": existing,
+            "conflicts": conflicts,
             "failed": failed,
+            "cables_created": cables_created,
         }
 
 
@@ -1673,6 +2097,19 @@ class FullDiscoveryJob(Job):
         default=True,
         description="Create ipam.VLAN objects from the SNMP Q-BRIDGE-MIB table.",
     )
+    create_cables = BooleanVar(
+        default=True,
+        description="Create dcim.Cable objects from LLDP/CDP neighbor data when both ends can be resolved.",
+    )
+    profile = ObjectVar(
+        model=DiscoveryProfile,
+        required=False,
+        description="Optional DiscoveryProfile supplying scan scope and settings.",
+    )
+    create_devices = BooleanVar(
+        default=True,
+        description="Create new Nautobot Device objects for discovered devices without an existing match.",
+    )
     dryrun = DryRunVar()
     timeout = IntegerVar(
         default=3,
@@ -1689,13 +2126,14 @@ class FullDiscoveryJob(Job):
 
     def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", ssh_username, ssh_password,
             enable_ping, enable_snmp, enable_ssh, populate_interfaces=True, populate_ip_addresses=True,
-            include_neighbors=True, include_vlans=True, populate_vlans=True, dryrun=False, timeout, concurrency):
+            include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False, timeout, concurrency):
         config = get_plugin_config()
         config["populate_interfaces"] = populate_interfaces
         config["populate_ip_addresses"] = populate_ip_addresses
         config["include_neighbors"] = include_neighbors
         config["include_vlans"] = include_vlans
         config["populate_vlans"] = populate_vlans
+        config["create_cables"] = create_cables
         snmp_version = str(snmp_version or "2c").strip().lower()
         if snmp_version.startswith("v"):
             snmp_version = snmp_version[1:]
@@ -1715,9 +2153,23 @@ class FullDiscoveryJob(Job):
         config["snmpv3_context_name"] = snmpv3_context_name or ""
         ssh_username = ssh_username or config.get("ssh_username", "admin")
         ssh_password = ssh_password or config.get("ssh_password", "")
+        apply_profile(config, profile)
         ssh_port = config.get("ssh_port", 22)
-        network = IPNetwork(target_network)
+
+        networks, excluded = _resolve_networks(target_network, profile)
+        if not networks:
+            self.logger.error("No valid target networks to scan (profile or target_network required).")
+            return {"error": "No valid target networks to scan"}
+        network = networks[0]
         scan_name = f"Full Scan: {network}"
+
+        all_hosts = _expanded_hosts(networks, excluded)
+        if profile and profile.maximum_ip_addresses and len(all_hosts) > profile.maximum_ip_addresses:
+            self.logger.error(
+                "Profile %s exceeds maximum_ip_addresses (%d > %d).",
+                profile.name, len(all_hosts), profile.maximum_ip_addresses,
+            )
+            return {"error": f"Profile {profile.name} exceeds maximum_ip_addresses ({profile.maximum_ip_addresses})"}
 
         discovery_scan = DiscoveryScan.objects.create(
             name=scan_name,
@@ -1728,12 +2180,12 @@ class FullDiscoveryJob(Job):
 
         self.logger.info("Starting full discovery of %s", network)
 
-        all_hosts = list(network)
         live_hosts = set()
         discovered_hosts = set()
         total_discovered = 0
         total_created = 0
         total_existing = 0
+        total_conflicts = 0
         total_failed = 0
 
         # Phase 1: Ping Sweep
@@ -1762,7 +2214,7 @@ class FullDiscoveryJob(Job):
         snmp_results = {}
         if enable_snmp and live_hosts:
             self.logger.info("Phase 2: SNMP discovery on %d live hosts", len(live_hosts))
-            config["snmp_timeout"] = timeout
+            config["snmp_timeout"] = config.get("profile_snmp_timeout") or timeout
 
             lock = threading.Lock()
             for ip_str in live_hosts:
@@ -1774,51 +2226,25 @@ class FullDiscoveryJob(Job):
                             snmp_results[ip_str] = info
                             total_discovered += 1
 
-                        if dryrun:
-                            device = None
-                            result_status = "new"
-                            error = "Dry-run: device discovered but not created"
-                        else:
-                            device, result_status, error = create_device_in_nautobot(
-                                info["hostname"], ip_str, info["vendor"], info["model"],
-                                info["serial"], info["os_version"], info["platform_info"],
-                                config, discovery_scan, info,
-                            )
-
-                        DiscoveryResult.objects.create(
-                            scan=discovery_scan,
-                            ip_address=ip_str,
-                            hostname=info["hostname"],
-                            vendor=info["vendor"],
-                            model=info["model"],
-                            serial_number=info["serial"],
-                            os_version=info["os_version"],
-                            platform_name=info["platform_info"]["platform_name"] if info["platform_info"] else "",
-                            discovery_method="snmp",
-                            result_status=result_status,
-                            nautobot_device=device,
-                            sys_location=info.get("sys_location", ""),
-                            sys_contact=info.get("sys_contact", ""),
-                            interfaces_found=info.get("interfaces_found", 0),
-                            ip_addresses_found=info.get("ip_addresses_found", 0),
-                            neighbors_found=info.get("neighbors_found", 0),
-                            vlans_found=info.get("vlans_found", 0),
-                            discovered_data={
-                                "interfaces": info.get("interfaces", []),
-                                "ip_addresses": info.get("ip_addresses", []),
-                                "arp_table": info.get("arp_table", []),
-                                "physical": info.get("physical", []),
-                                "neighbors": info.get("neighbors", []),
-                                "vlans": info.get("vlans", []),
-                            },
-                            error_message=error,
+                        result_status, device, error, created_now = finalize_discovery(
+                            discovery_scan,
+                            ip_str,
+                            "snmp",
+                            info,
+                            config,
+                            auto_create=create_devices,
+                            dryrun=dryrun,
                         )
 
-                        if result_status == "new":
-                            if not dryrun:
+                        with lock:
+                            if created_now:
                                 total_created += 1
-                        elif result_status == "existing":
-                            total_existing += 1
+                            elif result_status == "existing":
+                                total_existing += 1
+                            elif result_status == "failed":
+                                total_failed += 1
+                            elif result_status in ("partial", "conflict"):
+                                total_conflicts += 1
 
                         self.logger.info(
                             "SNMP: %s -> %s (%s)%s",
@@ -1840,7 +2266,7 @@ class FullDiscoveryJob(Job):
             lock = threading.Lock()
 
             def ssh_scan(ip_str):
-                nonlocal total_discovered, total_created, total_existing, total_failed
+                nonlocal total_discovered, total_created, total_existing, total_conflicts, total_failed
                 try:
                     info = ssh_connect_and_discover(
                         ip_str, ssh_username, ssh_password,
@@ -1856,41 +2282,25 @@ class FullDiscoveryJob(Job):
                     with lock:
                         total_discovered += 1
 
-                    if dryrun:
-                        device = None
-                        result_status = "new"
-                        error = "Dry-run: device discovered but not created"
-                    else:
-                        device, result_status, error = create_device_in_nautobot(
-                            info["hostname"], ip_str, info["vendor"], info["model"],
-                            info["serial"], info["os_version"], None,
-                            config, discovery_scan,
-                        )
-
-                    DiscoveryResult.objects.create(
-                        scan=discovery_scan,
-                        ip_address=ip_str,
-                        hostname=info["hostname"],
-                        vendor=info["vendor"],
-                        model=info["model"],
-                        serial_number=info["serial"],
-                        os_version=info["os_version"],
-                        platform_name="",
-                        discovery_method="ssh",
-                        result_status=result_status,
-                        nautobot_device=device,
-                        error_message=error,
-                        discovered_data={"command_outputs": info.get("command_outputs", {})},
+                    result_status, device, error, created_now = finalize_discovery(
+                        discovery_scan,
+                        ip_str,
+                        "ssh",
+                        info,
+                        config,
+                        auto_create=create_devices,
+                        dryrun=dryrun,
                     )
 
                     with lock:
-                        if result_status == "new":
-                            if not dryrun:
-                                total_created += 1
+                        if created_now:
+                            total_created += 1
                         elif result_status == "existing":
                             total_existing += 1
-                        else:
+                        elif result_status == "failed":
                             total_failed += 1
+                        elif result_status in ("partial", "conflict"):
+                            total_conflicts += 1
 
                     self.logger.info(
                         "SSH: %s -> %s (%s)%s",
@@ -1912,8 +2322,13 @@ class FullDiscoveryJob(Job):
                         pass
 
         # Finalize
+        cables_created = 0
+        if config.get("create_cables", True):
+            cables_created = link_neighbors_to_cables(discovery_scan, config)
+
         discovery_scan.devices_discovered = total_discovered
         discovery_scan.devices_created = total_created
+        discovery_scan.cables_created = cables_created
         discovery_scan.status = "completed"
         discovery_scan.save()
 
@@ -1922,6 +2337,7 @@ class FullDiscoveryJob(Job):
             f"{total_discovered} discovered, "
             f"{total_created} created, "
             f"{total_existing} existing, "
+            f"{total_conflicts} conflicts, "
             f"{total_failed} failed"
         )
         self.logger.info(summary)
@@ -1934,7 +2350,329 @@ class FullDiscoveryJob(Job):
             "discovered": total_discovered,
             "created": total_created,
             "existing": total_existing,
+            "conflicts": total_conflicts,
             "failed": total_failed,
+            "cables_created": cables_created,
+        }
+
+
+# ------------------------------------------------------------------ #
+#  Job: Crawl Discovery                                               #
+# ------------------------------------------------------------------ #
+
+
+class CrawlDiscoveryJob(Job):
+    """Discover devices iteratively from a seed device using SNMP.
+
+    Starts at the seed device's management IP, walks its LLDP/CDP neighbor
+    table via SNMP, creates/updates the discovered devices, and repeats for
+    each neighbor up to ``max_depth`` hops (breadth-first). A visited set
+    plus the depth and device caps keep the crawl finite.
+    """
+
+    class Meta:
+        name = "Crawl Discovery"
+        description = """
+        Discover devices iteratively from a seed device using SNMP.
+
+        Starting from the seed device's management IP, each hop walks the
+        LLDP/CDP neighbor table, creates/updates the discovered devices, and
+        continues crawling from each neighbor's management IP up to
+        ``max_depth`` hops.
+
+        Requires SNMP read access (v1/v2c community or SNMPv3 USM) to the
+        system and LLDP/CDP tables on every device being crawled.
+        """
+        dryrun_default = True
+        has_sensitive_variables = True
+        soft_time_limit = 1800
+        time_limit = 3600
+        template_name = "nautobot_plugin_device_auto_discovery/snmp_job_form.html"
+
+    seed_device = ObjectVar(
+        model=Device,
+        description="Nautobot Device to start the crawl from.",
+    )
+    seed_ip = StringVar(
+        default="",
+        description="Optional management IP override for the seed device (used when its primary IP is not reachable).",
+    )
+    max_depth = IntegerVar(
+        default=2,
+        min_value=1,
+        max_value=10,
+        description="Maximum number of hops to crawl from the seed device.",
+    )
+    max_devices = IntegerVar(
+        default=50,
+        min_value=1,
+        max_value=1000,
+        description="Maximum number of devices to discover during the crawl.",
+    )
+    snmp_version = ChoiceVar(
+        default="2c",
+        choices=(("1", "SNMPv1"), ("2c", "SNMPv2c"), ("3", "SNMPv3")),
+        description="SNMP version to use: v1/v2c community or v3 USM.",
+    )
+    snmp_community = StringVar(
+        default="public",
+        description="SNMP community string (used for v1/v2c; overrides plugin default).",
+    )
+    snmpv3_username = StringVar(
+        default="",
+        description="SNMPv3 USM username (used when snmp_version is '3').",
+    )
+    snmpv3_auth_protocol = StringVar(
+        default="SHA",
+        description="SNMPv3 authentication protocol: noAuth, MD5, SHA, SHA-256, SHA-384, SHA-512. Ignored without an auth key.",
+    )
+    snmpv3_auth_key = StringVar(
+        default="",
+        description="SNMPv3 authentication passphrase. Sensitive; do not schedule or approve runs.",
+    )
+    snmpv3_priv_protocol = StringVar(
+        default="AES",
+        description="SNMPv3 privacy protocol: noPriv, DES, 3DES, AES, AES-192, AES-256. Ignored without a privacy key.",
+    )
+    snmpv3_priv_key = StringVar(
+        default="",
+        description="SNMPv3 privacy/encryption passphrase. Sensitive; do not schedule or approve runs.",
+    )
+    snmpv3_context_name = StringVar(
+        default="",
+        description="Optional SNMPv3 context name (for v3B / context-engine-ID setups).",
+    )
+    timeout = IntegerVar(
+        default=3,
+        min_value=1,
+        max_value=10,
+        description="SNMP timeout in seconds per host.",
+    )
+    concurrency = IntegerVar(
+        default=10,
+        min_value=1,
+        max_value=50,
+        description="Number of concurrent SNMP probes.",
+    )
+    populate_interfaces = BooleanVar(
+        default=True,
+        description="Create dcim.Interface objects from the IF-MIB table.",
+    )
+    populate_ip_addresses = BooleanVar(
+        default=True,
+        description="Create and assign ipam.IPAddress objects from the IP-MIB table.",
+    )
+    include_neighbors = BooleanVar(
+        default=True,
+        description="Walk LLDP and CDP neighbor tables and continue the crawl from them.",
+    )
+    include_vlans = BooleanVar(
+        default=True,
+        description="Walk the Q-BRIDGE-MIB VLAN table.",
+    )
+    populate_vlans = BooleanVar(
+        default=True,
+        description="Create ipam.VLAN objects from the Q-BRIDGE-MIB table.",
+    )
+    create_cables = BooleanVar(
+        default=True,
+        description="Create dcim.Cable objects from LLDP/CDP neighbor data when both ends can be resolved.",
+    )
+    profile = ObjectVar(
+        model=DiscoveryProfile,
+        required=False,
+        description="Optional DiscoveryProfile supplying scan settings (scope is driven by the seed device).",
+    )
+    create_devices = BooleanVar(
+        default=True,
+        description="Create new Nautobot Device objects for discovered devices without an existing match.",
+    )
+    dryrun = DryRunVar()
+
+    def run(self, *, seed_device, seed_ip="", max_depth, max_devices, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False):
+        config = get_plugin_config()
+        config["populate_interfaces"] = populate_interfaces
+        config["populate_ip_addresses"] = populate_ip_addresses
+        config["include_neighbors"] = include_neighbors
+        config["include_vlans"] = include_vlans
+        config["populate_vlans"] = populate_vlans
+        config["create_cables"] = create_cables
+        config["snmp_timeout"] = timeout
+        config["snmp_retries"] = 2
+
+        apply_profile(config, profile)
+        config["snmp_timeout"] = config.get("profile_snmp_timeout") or timeout
+
+        if isinstance(seed_device, str):
+            seed_device = Device.objects.get(pk=seed_device)
+        if not seed_device:
+            self.logger.error("A seed device is required.")
+            return {"error": "A seed device is required"}
+
+        snmp_version = str(snmp_version or "2c").strip().lower()
+        if snmp_version.startswith("v"):
+            snmp_version = snmp_version[1:]
+        if snmp_version not in ("1", "2", "2c", "3"):
+            self.logger.error("Invalid snmp_version %r; expected '1', '2c', or '3'.", snmp_version)
+            return {"error": f"Invalid snmp_version {snmp_version!r}"}
+        if snmp_version == "3" and not (snmpv3_username or "").strip():
+            self.logger.error("snmp_version '3' requires an SNMPv3 username.")
+            return {"error": "snmp_version '3' requires an SNMPv3 username"}
+        config["snmp_version"] = snmp_version
+        config["snmp_community"] = snmp_community or config.get("snmp_community", "public")
+        config["snmpv3_username"] = snmpv3_username or ""
+        config["snmpv3_auth_protocol"] = snmpv3_auth_protocol or "SHA"
+        config["snmpv3_auth_key"] = snmpv3_auth_key or ""
+        config["snmpv3_priv_protocol"] = snmpv3_priv_protocol or "AES"
+        config["snmpv3_priv_key"] = snmpv3_priv_key or ""
+        config["snmpv3_context_name"] = snmpv3_context_name or ""
+
+        start_ip = (seed_ip or "").strip()
+        if not start_ip:
+            if seed_device.primary_ip4:
+                start_ip = str(seed_device.primary_ip4.address.ip)
+            elif seed_device.primary_ip6:
+                start_ip = str(seed_device.primary_ip6.address.ip)
+        if not start_ip:
+            self.logger.error(
+                "Seed device %s has no primary IP; provide a seed_ip override.", seed_device.name
+            )
+            return {
+                "error": f"Seed device {seed_device.name} has no primary IP; provide a seed_ip override."
+            }
+
+        discovery_scan = DiscoveryScan.objects.create(
+            name=f"Crawl from {seed_device.name}",
+            scan_method=DiscoveryScan.ScanMethod.CRAWL,
+            target_network=start_ip,
+            seed_device=seed_device,
+            status="running",
+        )
+
+        self.logger.info(
+            "Starting crawl from %s (%s), max_depth=%d, max_devices=%d",
+            seed_device.name,
+            start_ip,
+            max_depth,
+            max_devices,
+        )
+
+        discovered = 0
+        created = 0
+        existing = 0
+        conflicts = 0
+        failed = 0
+        visited = {start_ip}
+        lock = threading.Lock()
+
+        def process(ip_str, depth):
+            nonlocal discovered, created, existing, conflicts, failed
+            try:
+                info = snmp_discover_device(ip_str, config)
+                if not info:
+                    return []
+
+                with lock:
+                    discovered += 1
+
+                result_status, device, error, created_now = finalize_discovery(
+                    discovery_scan,
+                    ip_str,
+                    "snmp",
+                    info,
+                    config,
+                    auto_create=create_devices,
+                    dryrun=dryrun,
+                )
+
+                with lock:
+                    if created_now:
+                        created += 1
+                    elif result_status == "existing":
+                        existing += 1
+                    elif result_status == "failed":
+                        failed += 1
+                    elif result_status in ("partial", "conflict"):
+                        conflicts += 1
+
+                self.logger.info(
+                    "Crawl: %s -> %s (%s)%s",
+                    ip_str,
+                    info["hostname"],
+                    result_status,
+                    " [dry-run]" if dryrun else "",
+                )
+
+                if depth + 1 >= max_depth or not config.get("include_neighbors", True):
+                    return []
+
+                next_ips = []
+                for neighbor in info.get("neighbors") or []:
+                    neighbor_ip = neighbor_management_ip(neighbor)
+                    if not neighbor_ip:
+                        continue
+                    with lock:
+                        if neighbor_ip not in visited and len(visited) < max_devices:
+                            visited.add(neighbor_ip)
+                            next_ips.append(neighbor_ip)
+                return next_ips
+
+            except Exception as exc:
+                with lock:
+                    failed += 1
+                self.logger.error("Crawl error for %s: %s", ip_str, exc)
+                return []
+
+        queue = deque([start_ip])
+        depth = 0
+        while queue and depth < max_depth:
+            level = list(queue)
+            queue.clear()
+            next_level = []
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = {executor.submit(process, ip, depth): ip for ip in level}
+                for future in as_completed(futures):
+                    try:
+                        next_level.extend(future.result())
+                    except Exception:
+                        pass
+            queue = deque(next_level)
+            depth += 1
+            if len(visited) >= max_devices:
+                break
+
+        cables_created = 0
+        if config.get("create_cables", True):
+            cables_created = link_neighbors_to_cables(discovery_scan, config)
+
+        discovery_scan.devices_discovered = discovered
+        discovery_scan.devices_created = created
+        discovery_scan.cables_created = cables_created
+        discovery_scan.status = "completed"
+        discovery_scan.save()
+
+        self.logger.info(
+            "Crawl discovery complete: %d discovered, %d created, %d existing, %d conflicts, %d failed, %d cables",
+            discovered,
+            created,
+            existing,
+            conflicts,
+            failed,
+            cables_created,
+        )
+
+        return {
+            "scan": discovery_scan.pk,
+            "seed_device": seed_device.name,
+            "seed_ip": start_ip,
+            "max_depth": max_depth,
+            "max_devices": max_devices,
+            "discovered": discovered,
+            "created": created,
+            "existing": existing,
+            "conflicts": conflicts,
+            "failed": failed,
+            "cables_created": cables_created,
         }
 
 
@@ -1944,4 +2682,5 @@ register_jobs(
     SNMPDiscoveryJob,
     SSHDiscoveryJob,
     FullDiscoveryJob,
+    CrawlDiscoveryJob,
 )

@@ -1,2 +1,0 @@
-[nautobot.apps]
-nautobot_plugin_device_auto_discovery = nautobot_plugin_device_auto_discovery

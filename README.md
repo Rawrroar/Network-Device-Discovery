@@ -249,6 +249,18 @@ curl -X POST \
   --data '{"data": {"target_network": "10.0.0.0/24"}}'
 ```
 
+The plugin also exposes its own REST API under `/api/plugins/device-auto-discovery/`:
+
+| Endpoint | Model |
+|----------|-------|
+| `/discovery-scans/` | `DiscoveryScan` — one row per scan run |
+| `/discovery-results/` | `DiscoveryResult` — one row per host per scan |
+| `/discovery-profiles/` | `DiscoveryProfile` — reusable scan-scope bundles |
+| `/discovered-devices/` | `DiscoveredDevice` — per-IP correlation ledger |
+
+Each endpoint supports the standard Nautobot queryset actions (list, retrieve, create,
+update, delete) and is searchable via the `q` parameter.
+
 ## Supported Platforms
 
 The plugin maps SNMP OIDs to Nautobot platforms for these vendors:

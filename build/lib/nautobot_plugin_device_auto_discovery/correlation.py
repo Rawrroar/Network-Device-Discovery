@@ -21,7 +21,7 @@ from nautobot.ipam.models import IPAddress
 
 def _devices_with_ip(ip_str):
     """Return devices whose primary IP address matches ``ip_str``."""
-    ip_obj = IPAddress.objects.filter(address__startswith=f"{ip_str}/").first()
+    ip_obj = IPAddress.objects.filter(host=ip_str).first()
     if not ip_obj:
         return []
     return list(Device.objects.filter(Q(primary_ip4=ip_obj) | Q(primary_ip6=ip_obj)))

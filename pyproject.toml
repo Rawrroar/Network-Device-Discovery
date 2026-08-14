@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nautobot-plugin-device-auto-discovery"
-version = "0.3.1"
+version = "0.3.2"
 description = "A Nautobot plugin for automatic network device discovery via ICMP, SNMP, and SSH."
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -36,8 +36,9 @@ Issues = "https://github.com/your-org/nautobot-plugin-device-auto-discovery/issu
 [project.entry-points."nautobot.apps"]
 nautobot_plugin_device_auto_discovery = "nautobot_plugin_device_auto_discovery"
 
-[tool.setuptools]
-packages = {find = {}}
+[tool.setuptools.packages.find]
+include = ["nautobot_plugin_device_auto_discovery*"]
+exclude = ["tests*", "nautobot_plugin_device_auto_discovery.tests*", "build*"]
 
 [tool.setuptools.package-data]
 nautobot_plugin_device_auto_discovery = [

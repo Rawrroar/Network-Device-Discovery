@@ -636,7 +636,7 @@ class SNMPDiscoveryJobTests(TestCase):
 
         device = Device.objects.get(name="switch-001")
         self.assertEqual(device.interfaces.count(), 2)
-        self.assertEqual(IPAddress.objects.filter(address="10.0.0.1/24").count(), 1)
+        self.assertEqual(IPAddress.objects.filter(host="10.0.0.1", mask_length=24).count(), 1)
         vlan_group = VLANGroup.objects.get(name="switch-001 VLANs")
         self.assertEqual(VLAN.objects.filter(vlan_group=vlan_group).count(), 2)
 
@@ -659,7 +659,7 @@ class SNMPDiscoveryJobTests(TestCase):
             self.assertEqual(result["created"], 0)
 
         self.assertFalse(Device.objects.filter(name="switch-001").exists())
-        self.assertFalse(IPAddress.objects.filter(address="10.0.0.1/24").exists())
+        self.assertFalse(IPAddress.objects.filter(host="10.0.0.1", mask_length=24).exists())
         self.assertFalse(VLANGroup.objects.filter(name="switch-001 VLANs").exists())
 
         discovery_result = DiscoveryResult.objects.get(ip_address="10.0.0.1")
@@ -688,7 +688,7 @@ class SNMPDiscoveryJobTests(TestCase):
 
         device = Device.objects.get(name="switch-001")
         self.assertEqual(device.interfaces.count(), 0)
-        self.assertFalse(IPAddress.objects.filter(address="10.0.0.1/24").exists())
+        self.assertFalse(IPAddress.objects.filter(host="10.0.0.1", mask_length=24).exists())
         self.assertFalse(VLANGroup.objects.filter(name="switch-001 VLANs").exists())
 
 

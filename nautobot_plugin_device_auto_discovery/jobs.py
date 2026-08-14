@@ -458,7 +458,7 @@ def _find_interface_by_ip(ip_str):
         netaddr.IPAddress(ip_str)
     except Exception:
         return None
-    ip_obj = IPAddress.objects.filter(address__startswith=f"{ip_str}/").first()
+    ip_obj = IPAddress.objects.filter(host=ip_str).first()
     if ip_obj and isinstance(ip_obj.assigned_object, Interface):
         return ip_obj.assigned_object
     return None

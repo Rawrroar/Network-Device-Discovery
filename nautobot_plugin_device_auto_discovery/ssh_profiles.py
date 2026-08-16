@@ -16,6 +16,8 @@ regexes (see ``ssh_connect_and_discover``).
 #     "requires_enable": bool - escalate a ">" shell prompt to "#" before commands,
 #     "pre_commands": list of commands run first to disable paging (errors ignored),
 #     "commands": list of identification commands to run,
+#     "data_commands": list of extra commands run for IP/VRF data collection
+#         (output is parsed by parse_ssh_vrfs / parse_ssh_ip_addresses),
 #     "parsers": {
 #         "hostname": [regex...],
 #         "model":    [regex...],
@@ -32,6 +34,7 @@ SSH_PROFILES = {
         "requires_enable": True,
         "pre_commands": ["terminal length 0"],
         "commands": ["show version", "show inventory"],
+        "data_commands": ["show ip vrf", "show ip interface brief", "show ipv6 interface brief"],
         "parsers": {
             "hostname": [
                 r"(?:hostname|host)\s+(\S+)",
@@ -60,6 +63,7 @@ SSH_PROFILES = {
         "requires_enable": False,
         "pre_commands": ["set cli screen-length 0", "set cli screen-width 0"],
         "commands": ["show version", "show chassis hardware"],
+        "data_commands": ["show routing-instances", "show interfaces terse"],
         "parsers": {
             "hostname": [
                 r"Hostname:\s*(\S+)",
@@ -85,6 +89,7 @@ SSH_PROFILES = {
         "requires_enable": False,
         "pre_commands": ["terminal length 0"],
         "commands": ["show version"],
+        "data_commands": ["show vrf", "show ip interface brief"],
         "parsers": {
             "hostname": [
                 r"(?:hostname|host)\s+(\S+)",
@@ -108,6 +113,7 @@ SSH_PROFILES = {
         "requires_enable": True,
         "pre_commands": ["screen-length disable"],
         "commands": ["display version", "display device manuinfo"],
+        "data_commands": ["display ip vpn-instance", "display ip interface"],
         "parsers": {
             "hostname": [
                 r"^\s*(\S+)\s*\[.*?\]\s*$",
@@ -137,6 +143,7 @@ SSH_PROFILES = {
         "requires_enable": False,
         "pre_commands": ["environment no more"],
         "commands": ["show system version", "show system information", "show chassis"],
+        "data_commands": ["show router instance", "show router interface"],
         "parsers": {
             "hostname": [
                 r"System Name\s*[:\s]+(\S+)",
@@ -162,6 +169,7 @@ SSH_PROFILES = {
         "requires_enable": False,
         "pre_commands": ["config system console", "set output standard", "end"],
         "commands": ["get system status"],
+        "data_commands": ["get system interface"],
         "parsers": {
             "hostname": [
                 r"Hostname\s*[:\s]+(\S+)",
@@ -186,6 +194,7 @@ SSH_PROFILES = {
         "requires_enable": False,
         "pre_commands": ["set cli pager off", "set cli pagination off"],
         "commands": ["show system info"],
+        "data_commands": ["show interface all"],
         "parsers": {
             "hostname": [
                 r"hostname\s*[:\s]+(\S+)",
@@ -210,6 +219,7 @@ SSH_PROFILES = {
         "requires_enable": False,
         "pre_commands": ["terminal length 0"],
         "commands": ["show version"],
+        "data_commands": ["ip addr", "show ip interface brief", "show ipv6 interface brief"],
         "parsers": {
             "hostname": [
                 r"(?:hostname|host)\s+(\S+)",
@@ -237,4 +247,9 @@ GENERIC_INFO_COMMANDS = [
     "display version",
     "show system information",
     "display current-version",
+]
+
+# Data commands attempted for devices without a vendor profile (e.g. Linux).
+GENERIC_DATA_COMMANDS = [
+    "ip addr",
 ]

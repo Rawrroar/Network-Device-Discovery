@@ -5,7 +5,10 @@ common MIB tables used during discovery:
 
 - System scalars: sysName, sysDescr, sysObjectID, sysContact, sysLocation
 - IF-MIB interface table (names, types, MACs, speeds, MTUs, status)
-- IP-MIB address table and ARP (net-to-media) table
+- IP-MIB address table (RFC 1213 ipAddrTable and IP-MIB ipAddressTable,
+  IPv4 and IPv6) and ARP (net-to-media) table
+- VRF tables: MPLS-VPN-MIB mplsVpnVrfTable plus both revisions of the
+  Cisco CISCO-VRF-MIB, with optional per-context (per-VRF) IP walking
 - ENTITY-MIB physical inventory (used for serial numbers)
 - LLDP-MIB and CISCO-CDP-MIB neighbor tables
 - Q-BRIDGE-MIB dot1qVlanStaticTable (VLAN IDs and names)
@@ -64,11 +67,37 @@ OID_IFALIAS = OID_IFXTABLE + ".18"
 OID_IPADDRTABLE = "1.3.6.1.2.1.4.20.1"  # ipAdEntIfIndex(.2).ipAdEntNetMask(.3)
 OID_IPADENTIFINDEX = OID_IPADDRTABLE + ".2"
 OID_IPADENTNETMASK = OID_IPADDRTABLE + ".3"
-OID_IPADDRESSTABLE = "1.3.6.1.2.1.4.34.1"  # ipAddressIfIndex(.1).ipAddressPrefix(.2)
+OID_IPADDRESSTABLE = "1.3.6.1.2.1.4.34.1"  # ipAddressIfIndex(.1).ipAddressType(.2).ipAddressPrefix(.3)
 OID_IPADDRESSIFINDEX = OID_IPADDRESSTABLE + ".1"
+OID_IPADDRESSTYPE = OID_IPADDRESSTABLE + ".2"
+OID_IPADDRESSPREFIX = OID_IPADDRESSTABLE + ".3"  # pointer into ipAddressPrefixTable
+OID_IPADDRESSPREFIXTABLE = "1.3.6.1.2.1.4.32.1"  # ipAddressPrefixIfIndex(.1).ipAddressPrefixLength(.4)
+OID_IPADDRESSPREFIXLENGTH = OID_IPADDRESSPREFIXTABLE + ".4"
 OID_IPNETTOMEDIATABLE = "1.3.6.1.2.1.4.22.1"  # ipNetToMediaIfIndex(.2).ipNetToMediaPhysAddress(.3)
 OID_IPNETTOMEDIAIFINDEX = OID_IPNETTOMEDIATABLE + ".2"
 OID_IPNETTOMEDIAPHYSADDRESS = OID_IPNETTOMEDIATABLE + ".3"
+
+# MPLS-VPN-MIB (RFC 4382) - mplsVpnVrfTable (index = VRF name)
+OID_MPLSVPNVRFTABLE = "1.3.6.1.3.118.1.2.2.1"
+OID_MPLSVPNVRFNAME = OID_MPLSVPNVRFTABLE + ".1"
+OID_MPLSVPNVRFDESCRIPTION = OID_MPLSVPNVRFTABLE + ".2"
+OID_MPLSVPNVRFRD = OID_MPLSVPNVRFTABLE + ".3"
+# mplsVpnInterfaceConfTable (index = VRF name . ifIndex)
+OID_MPLSVPNINTERFACECONFTABLE = "1.3.6.1.3.118.1.2.1.1"
+OID_MPLSVPNINTERFACECONFINDEX = OID_MPLSVPNINTERFACECONFTABLE + ".1"
+
+# CISCO-VRF-MIB classic (1.3.6.1.4.1.9.9.276) - cvrfVrfTable (index = VRF name)
+OID_CVRFVRFTABLE = "1.3.6.1.4.1.9.9.276.1.1.1.1"
+OID_CVRFVRFNAME = OID_CVRFVRFTABLE + ".1"
+OID_CVRFVRFINDEX = OID_CVRFVRFTABLE + ".2"
+
+# CISCO-VRF-MIB v2 (1.3.6.1.4.1.9.9.711) - cvVrfTable (index = cvVrfIndex)
+OID_CVVRFTABLE = "1.3.6.1.4.1.9.9.711.1.1.1.1"
+OID_CVVRFINDEX = OID_CVVRFTABLE + ".1"
+OID_CVVRFNAME = OID_CVVRFTABLE + ".2"
+# cvVrfInterfaceTable (index = cvVrfIndex . ifIndex)
+OID_CVVRFINTERFACETABLE = "1.3.6.1.4.1.9.9.711.1.2.1.1"
+OID_CVVRFINTERFACEIFINDEX = OID_CVVRFINTERFACETABLE + ".1"
 
 # ENTITY-MIB
 OID_ENTPHYSTABLE = "1.3.6.1.2.1.47.1.1.1.1"
@@ -609,47 +638,246 @@ def collect_interfaces(ip_str, config, max_rows=1000):
     return interfaces
 
 
-def collect_ip_addresses(ip_str, config, max_rows=1000):
+def collect_ip_addresses(ip_str, config, max_rows=1000, context_name=""):
     """Collect IP addresses from IP-MIB.
 
+    Walks both the RFC 1213 ``ipAddrTable`` and the IP-MIB
+    ``ipAddressTable`` (which supports IPv4 and IPv6). Prefix lengths are
+    resolved from ``ipAddressPrefixTable`` via the ``ipAddressPrefix``
+    pointer, falling back to ``ipAdEntNetMask`` and finally to a host
+    route (``/32`` / ``/128``), so rows are never silently dropped.
+
+    When ``context_name`` is set (SNMPv3), the walk is performed in that
+    SNMP context (typically a VRF) and every returned row is tagged with
+    ``vrf=context_name``.
+
     Returns:
-        list of dicts: {address, prefix_length, if_index}
+        list of dicts: {address, prefix_length, if_index, vrf}
+    """
+    auth = build_snmp_auth(config)
+    timeout = config.get("snmp_timeout", 3)
+    retries = config.get("snmp_retries", 2)
+    if context_name:
+        auth["context"] = context_name
+
+    addresses = []
+    seen = set()
+
+    def _append(address, addr_type, prefix_length, if_index):
+        if not address:
+            return
+        if prefix_length is None:
+            prefix_length = 32 if addr_type == 1 else 128
+        key = (address, str(if_index), context_name)
+        if key in seen:
+            return
+        seen.add(key)
+        addresses.append(
+            {
+                "address": address,
+                "prefix_length": prefix_length,
+                "if_index": str(if_index),
+                "vrf": context_name or None,
+            }
+        )
+
+    # IP-MIB ipAddressTable (index: ifIndex.ipAddressType.<addr octets>)
+    ifindex_map = walk_columns(ip_str, OID_IPADDRESSIFINDEX, auth, timeout, retries, max_rows)
+    if ifindex_map:
+        prefix_ptr_map = walk_columns(ip_str, OID_IPADDRESSPREFIX, auth, timeout, retries, max_rows)
+        prefix_length_map = walk_columns(ip_str, OID_IPADDRESSPREFIXLENGTH, auth, timeout, retries, max_rows)
+        for suffix, if_index in ifindex_map.items():
+            parsed_if, addr_type, address = _parse_ipaddress_table_index(suffix)
+            prefix_length = None
+            pointer = prefix_ptr_map.get(suffix)
+            if pointer:
+                prefix_length = _prefix_length_from_pointer(pointer, prefix_length_map)
+            _append(address, addr_type, prefix_length, if_index or parsed_if)
+
+    # RFC 1213 ipAddrTable (index = IP address) fills any gaps the
+    # ipAddressTable did not report.
+    netmask_map = walk_columns(ip_str, OID_IPADENTNETMASK, auth, timeout, retries, max_rows)
+    for addr, if_index in walk_columns(ip_str, OID_IPADENTIFINDEX, auth, timeout, retries, max_rows).items():
+        prefix_length = _netmask_to_prefix(netmask_map.get(addr, ""))
+        _append(addr, 1, prefix_length, if_index)
+
+    return addresses
+
+
+def _parse_ipaddress_table_index(suffix):
+    """Split an ipAddressTable index suffix into (if_index, addr_type, address).
+
+    The ipAddressTable index is ``ipAddressIfIndex.ipAddressType.<addr
+    octets>``, where IPv4 addresses use 4 dotted octets and IPv6
+    addresses use 16. Returns ``(None, None, None)`` on failure.
+    """
+    parts = str(suffix).split(".")
+    if len(parts) < 3:
+        return None, None, None
+    try:
+        if_index = parts[0]
+        addr_type = int(parts[1])
+    except (TypeError, ValueError):
+        return None, None, None
+    octets = parts[2:]
+    if addr_type == 1 and len(octets) == 4:
+        return if_index, addr_type, ".".join(octets)
+    if addr_type == 2 and len(octets) == 16:
+        try:
+            ipv6 = IPAddress(int.from_bytes(bytes(int(o) for o in octets), "big"))
+        except (TypeError, ValueError):
+            return None, None, None
+        return if_index, addr_type, str(ipv6)
+    return None, None, None
+
+
+def _prefix_length_from_pointer(pointer, prefix_length_map):
+    """Resolve a prefix length for an ``ipAddressPrefix`` pointer OID.
+
+    The pointer value references an entry in ``ipAddressPrefixTable``;
+    the matching ``ipAddressPrefixLength`` value is looked up by the
+    table index extracted from the pointer. Returns None on failure.
+    """
+    if not pointer:
+        return None
+    value = str(pointer)
+    suffix = ""
+    for base in ("1.3.6.1.2.1.4.32.1.4", OID_IPADDRESSPREFIXTABLE):
+        if value.startswith(base + "."):
+            suffix = value[len(base) + 1 :]
+            break
+    if not suffix:
+        return None
+    # When the table base (without a column) was stripped, drop the
+    # column component (ipAddressPrefixLength is column .4).
+    if value.startswith(OID_IPADDRESSPREFIXTABLE + ".") and "." in suffix:
+        suffix = suffix.split(".", 1)[1]
+    if suffix not in prefix_length_map:
+        return None
+    try:
+        return int(prefix_length_map[suffix])
+    except (TypeError, ValueError):
+        return None
+
+
+def collect_vrfs(ip_str, config, max_rows=1000):
+    """Collect VRF (virtual routing and forwarding) instances.
+
+    Walks the standard MPLS-VPN-MIB (RFC 4382) plus both revisions of the
+    Cisco CISCO-VRF-MIB (classic 1.3.6.1.4.1.9.9.276 and the newer
+    1.3.6.1.4.1.9.9.711), merging results by VRF name. Interface
+    membership is gathered from ``mplsVpnInterfaceConfTable`` and the
+    Cisco ``cvVrfInterfaceTable``.
+
+    Returns:
+        list of dicts: {name, rd, description, interfaces: [if_index...]}
     """
     auth = build_snmp_auth(config)
     timeout = config.get("snmp_timeout", 3)
     retries = config.get("snmp_retries", 2)
 
-    addresses = []
+    vrfs = {}
 
-    # RFC 1213 ipAddrTable (index = IP address)
-    ifindex_map = walk_columns(ip_str, OID_IPADENTIFINDEX, auth, timeout, retries, max_rows)
-    netmask_map = walk_columns(ip_str, OID_IPADENTNETMASK, auth, timeout, retries, max_rows)
-    if ifindex_map:
-        for addr, if_index in ifindex_map.items():
-            prefix_length = _netmask_to_prefix(netmask_map.get(addr, ""))
-            if prefix_length is None:
-                continue
-            addresses.append(
-                {
-                    "address": addr,
-                    "prefix_length": prefix_length,
-                    "if_index": str(if_index),
-                }
-            )
+    def _add_vrf(name, rd="", description="", interfaces=None):
+        if not name:
+            return
+        entry = vrfs.setdefault(name, {"name": name, "rd": "", "description": "", "interfaces": []})
+        if rd and not entry["rd"]:
+            entry["rd"] = rd
+        if description and not entry["description"]:
+            entry["description"] = description
+        for if_index in interfaces or []:
+            if if_index not in entry["interfaces"]:
+                entry["interfaces"].append(if_index)
 
-    # IP-MIB ipAddressTable fallback (index = IPv4/IPv6 string)
-    if not addresses:
-        addr_ifindex_map = walk_columns(ip_str, OID_IPADDRESSIFINDEX, auth, timeout, retries, max_rows)
-        for addr, if_index in addr_ifindex_map.items():
-            addresses.append(
-                {
-                    "address": addr,
-                    "prefix_length": None,
-                    "if_index": str(if_index),
-                }
-            )
+    # MPLS-VPN-MIB mplsVpnVrfTable (index and value = VRF name)
+    name_map = walk_columns(ip_str, OID_MPLSVPNVRFNAME, auth, timeout, retries, max_rows)
+    if name_map:
+        desc_map = walk_columns(ip_str, OID_MPLSVPNVRFDESCRIPTION, auth, timeout, retries, max_rows)
+        rd_map = walk_columns(ip_str, OID_MPLSVPNVRFRD, auth, timeout, retries, max_rows)
+        for key, name in name_map.items():
+            _add_vrf(name, rd=_format_rd(rd_map.get(key, "")), description=desc_map.get(key, ""))
+        # Interface membership: mplsVpnInterfaceConfTable (index vrfName.ifIndex)
+        for key, value in walk_columns(
+            ip_str, OID_MPLSVPNINTERFACECONFINDEX, auth, timeout, retries, max_rows
+        ).items():
+            vrf_name = _decode_ascii_index(key, drop_last=True)
+            if vrf_name:
+                _add_vrf(vrf_name, interfaces=[value])
 
-    return addresses
+    # Cisco CISCO-VRF-MIB classic (cvrfVrfTable, index = VRF name)
+    classic_name_map = walk_columns(ip_str, OID_CVRFVRFNAME, auth, timeout, retries, max_rows)
+    for key, name in classic_name_map.items():
+        _add_vrf(name)
+
+    # Cisco CISCO-VRF-MIB v2 (cvVrfTable, index = cvVrfIndex)
+    vrf_index_to_name = {}
+    for key, name in walk_columns(ip_str, OID_CVVRFNAME, auth, timeout, retries, max_rows).items():
+        _add_vrf(name)
+        vrf_index_to_name[key] = name
+    # v2 interface table: index cvVrfIndex.ifIndex, value = ifIndex
+    for key, value in walk_columns(
+        ip_str, OID_CVVRFINTERFACEIFINDEX, auth, timeout, retries, max_rows
+    ).items():
+        cvrf_index = str(key).split(".", 1)[0]
+        name = vrf_index_to_name.get(cvrf_index)
+        if name:
+            _add_vrf(name, interfaces=[value])
+
+    return list(vrfs.values())
+
+
+def _decode_ascii_index(suffix, drop_last=False):
+    """Decode an OctetString table index from its dotted byte codes.
+
+    SNMP OctetString indexes are rendered as one sub-identifier per byte;
+    this converts them back to text. When ``drop_last`` is set, a
+    trailing integer component (e.g. an ifIndex in a ``(VRF, ifIndex)``
+    index) is discarded first. Returns "" on failure.
+    """
+    parts = str(suffix).split(".")
+    if drop_last and parts:
+        parts = parts[:-1]
+    if not parts:
+        return ""
+    try:
+        return "".join(chr(int(part)) for part in parts)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _format_rd(raw):
+    """Format an MPLS-VPN-MIB route distinguisher as a readable string.
+
+    Accepts the RFC 4364 octet encodings (8-byte, 4-byte or 3-byte) or an
+    already-formatted ``ASN:NN`` string. Returns "" for empty input.
+    """
+    if not raw:
+        return ""
+    raw = str(raw)
+    if ":" in raw and all(ch in "0123456789:" for ch in raw):
+        return raw[:64]
+    try:
+        b = bytes(ord(ch) & 0xFF for ch in raw)
+    except Exception:
+        return ""
+    if len(b) == 8:
+        rd_type = (b[0] << 8) | b[1]
+        if rd_type == 0:
+            number = (b[2] << 8) | b[3]
+            ipv4 = ".".join(str(o) for o in b[4:8])
+            return f"{number}:{ipv4}"
+        if rd_type == 1:
+            asn = (b[2] << 8) | b[3]
+            return f"{asn}:{int.from_bytes(b[4:8], 'big')}"
+        if rd_type == 2:
+            return f"{int.from_bytes(b[2:6], 'big')}:{int.from_bytes(b[6:8], 'big')}"
+        return f"0x{b.hex()}"
+    if len(b) == 4:
+        return f"{(b[0] << 8) | b[1]}:{(b[2] << 8) | b[3]}"
+    if len(b) == 3:
+        return f"{b[0]}:{int.from_bytes(b[1:3], 'big')}"
+    return f"0x{b.hex()}"
 
 
 def collect_arp_table(ip_str, config, max_rows=1000):
@@ -936,7 +1164,7 @@ def discover_snmp_tables(ip_str, config):
     Each collector is isolated so a single failure only drops one table.
 
     Returns:
-        dict with keys: system, interfaces, ip_addresses, arp_table,
+        dict with keys: system, interfaces, ip_addresses, vrfs, arp_table,
         physical, neighbors, vlans
     """
     max_rows = config.get("max_walk_oids", 1000)
@@ -947,6 +1175,7 @@ def discover_snmp_tables(ip_str, config):
         "system": {},
         "interfaces": [],
         "ip_addresses": [],
+        "vrfs": [],
         "arp_table": [],
         "physical": [],
         "neighbors": [],
@@ -978,6 +1207,30 @@ def discover_snmp_tables(ip_str, config):
         tables["ip_addresses"] = collect_ip_addresses(ip_str, config, max_rows=max_rows)
     except Exception as exc:
         logger.debug("SNMP IP collection failed for %s: %s", ip_str, exc)
+
+    try:
+        tables["vrfs"] = collect_vrfs(ip_str, config, max_rows=max_rows)
+    except Exception as exc:
+        logger.debug("SNMP VRF collection failed for %s: %s", ip_str, exc)
+
+    # With SNMPv3, walk the IP tables once per VRF name (used as the SNMP
+    # context) so addresses living inside VRFs are captured and tagged.
+    if tables["vrfs"] and str(config.get("snmp_version", "2c")).strip().lower() == "3":
+        for vrf in tables["vrfs"]:
+            vrf_name = vrf.get("name")
+            if not vrf_name:
+                continue
+            try:
+                context_ips = collect_ip_addresses(
+                    ip_str, config, max_rows=max_rows, context_name=vrf_name
+                )
+            except Exception as exc:
+                logger.debug("SNMP context IP collection failed for %s vrf %s: %s", ip_str, vrf_name, exc)
+                continue
+            for row in context_ips:
+                if row.get("vrf"):
+                    row["vrf"] = vrf_name
+            tables["ip_addresses"].extend(context_ips)
 
     try:
         tables["arp_table"] = collect_arp_table(ip_str, config, max_rows=max_rows)

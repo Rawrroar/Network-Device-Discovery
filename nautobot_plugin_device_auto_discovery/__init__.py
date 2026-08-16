@@ -31,6 +31,7 @@ DEFAULT_PLUGINS_CONFIG = {
     "concurrency": 10,
     "populate_interfaces": True,
     "populate_ip_addresses": True,
+    "populate_vrfs": True,
     "populate_vlans": True,
     "include_neighbors": True,
     "include_vlans": True,

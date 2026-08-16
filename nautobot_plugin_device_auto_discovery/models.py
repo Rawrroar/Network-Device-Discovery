@@ -171,6 +171,10 @@ class DiscoveryResult(PrimaryModel):
         default=0,
         help_text="Number of IP addresses discovered via SNMP.",
     )
+    vrfs_found = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of VRFs discovered via SNMP (MPLS-VPN-MIB / CISCO-VRF-MIB).",
+    )
     neighbors_found = models.PositiveIntegerField(
         default=0,
         help_text="Number of LLDP/CDP neighbors discovered via SNMP.",

@@ -44,13 +44,14 @@ from nautobot.dcim.models import (
 )
 from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
-from nautobot.ipam.models import IPAddress, Namespace, Prefix, VLAN, VLANGroup
+from nautobot.ipam.models import IPAddress, Namespace, Prefix, VLAN, VLANGroup, VRF, VRFPrefixAssignment
 
 from .models import DiscoveryProfile, DiscoveryResult, DiscoveryScan, DiscoveredDevice
 from .correlation import correlate_device
 from .mappings import lookup_platform_from_oid
 from .snmp_tables import discover_snmp_tables, find_chassis_model, find_chassis_serial, snmp_get
-from .ssh_profiles import SSH_PROFILES, GENERIC_INFO_COMMANDS
+from .ssh_parsing import parse_ssh_vrfs, parse_ssh_ip_addresses
+from .ssh_profiles import SSH_PROFILES, GENERIC_INFO_COMMANDS, GENERIC_DATA_COMMANDS
 from .utils import strip_domain_suffixes
 
 # Common SNMP constants kept for backward compatibility
@@ -711,6 +712,7 @@ def _result_discovered_data(info, method):
     return {
         "interfaces": info.get("interfaces", []),
         "ip_addresses": info.get("ip_addresses", []),
+        "vrfs": info.get("vrfs", []),
         "arp_table": info.get("arp_table", []),
         "physical": info.get("physical", []),
         "neighbors": info.get("neighbors", []),
@@ -830,6 +832,7 @@ def finalize_discovery(scan, ip_str, method, info, config, *, auto_create=True, 
         sys_contact=info.get("sys_contact", ""),
         interfaces_found=info.get("interfaces_found", 0),
         ip_addresses_found=info.get("ip_addresses_found", 0),
+        vrfs_found=info.get("vrfs_found", 0),
         neighbors_found=info.get("neighbors_found", 0),
         vlans_found=info.get("vlans_found", 0),
         discovered_data=_result_discovered_data(info, method),
@@ -974,7 +977,7 @@ def snmp_discover_device(ip_str, config):
     Returns:
         dict with hostname, sysdescr, sysobjectid, platform_info, vendor,
         model, serial, os_version, sys_contact, sys_location, interfaces,
-        ip_addresses, arp_table, physical, neighbors, vlans and table
+        ip_addresses, vrfs, arp_table, physical, neighbors, vlans and table
         counts, or None if the host is not SNMP-reachable.
     """
     tables = discover_snmp_tables(ip_str, config)
@@ -1032,12 +1035,14 @@ def snmp_discover_device(ip_str, config):
         "sys_location": clean_system_scalar(system.get("sys_location")),
         "interfaces": tables["interfaces"],
         "ip_addresses": tables["ip_addresses"],
+        "vrfs": tables["vrfs"],
         "arp_table": tables["arp_table"],
         "physical": tables["physical"],
         "neighbors": tables["neighbors"],
         "vlans": tables["vlans"],
         "interfaces_found": len(tables["interfaces"]),
         "ip_addresses_found": len(tables["ip_addresses"]),
+        "vrfs_found": len(tables["vrfs"]),
         "neighbors_found": len(tables["neighbors"]),
         "vlans_found": len(tables["vlans"]),
     }
@@ -1064,6 +1069,11 @@ def get_vlan_status():
     ).first()
 
 
+def get_vrf_status():
+    """Return the default 'Active' Status for ipam.VRF."""
+    return Status.objects.get_for_model(VRF).filter(name="Active").first() or Status.objects.get_for_model(VRF).first()
+
+
 def get_default_namespace():
     """Return the default 'Global' IPAM Namespace, creating it if needed.
 
@@ -1075,6 +1085,49 @@ def get_default_namespace():
         defaults={"description": "Default Global namespace. Created by Nautobot."},
     )
     return namespace
+
+
+def ensure_vrf_namespace(vrf_name):
+    """Find-or-create the per-VRF IPAM Namespace that owns its prefixes/IPs.
+
+    Nautobot enforces IP and prefix uniqueness per Namespace, so addresses
+    inside a VRF (which may overlap the global space or other VRFs) live in
+    a dedicated Namespace named after the VRF. Returns None on failure.
+    """
+    if not vrf_name:
+        return None
+    try:
+        namespace, _ = Namespace.objects.get_or_create(
+            name=vrf_name,
+            defaults={"description": f"IPAM namespace for VRF '{vrf_name}'. Created by Device Auto-Discovery."},
+        )
+        return namespace
+    except Exception as exc:
+        logger.debug("Failed to ensure VRF namespace %s: %s", vrf_name, exc)
+        return None
+
+
+def ensure_vrf(vrf_name):
+    """Find-or-create an ipam.VRF object within its own per-VRF Namespace.
+
+    Returns:
+        tuple (VRF object or None, bool created).
+    """
+    if not vrf_name:
+        return None, False
+    namespace = ensure_vrf_namespace(vrf_name)
+    if not namespace:
+        return None, False
+    try:
+        vrf, created = VRF.objects.get_or_create(
+            name=vrf_name,
+            namespace=namespace,
+            defaults={"status": get_vrf_status()},
+        )
+        return vrf, created
+    except Exception as exc:
+        logger.debug("Failed to ensure VRF %s: %s", vrf_name, exc)
+        return None, False
 
 
 def get_prefix_status():
@@ -1097,7 +1150,7 @@ def network_prefix_for(address, prefix_length):
         return None
 
 
-def ensure_parent_prefix(address, prefix_length, namespace=None):
+def ensure_parent_prefix(address, prefix_length, namespace=None, vrf=None):
     """Find-or-create a Network Prefix able to parent an IP address.
 
     Nautobot 3.x requires every IPAddress to have a containing Prefix in its
@@ -1105,6 +1158,11 @@ def ensure_parent_prefix(address, prefix_length, namespace=None):
     This computes the network for ``address/prefix_length`` and ensures that
     Prefix exists so IPAddress creation cannot fail. Host masks (/32, /128)
     are registered as host-route prefixes.
+
+    When ``vrf`` is given, the Prefix is additionally associated with the
+    VRF through a ``VRFPrefixAssignment`` (Nautobot 2.x/3.x stores the
+    VRF-to-Prefix association as a dedicated record, not a Prefix field), so
+    the resulting IPAddress derives its VRF from its parent Prefix.
 
     Returns:
         Prefix object, or None on failure.
@@ -1118,6 +1176,8 @@ def ensure_parent_prefix(address, prefix_length, namespace=None):
             namespace=namespace or get_default_namespace(),
             defaults={"status": get_prefix_status()},
         )
+        if vrf:
+            VRFPrefixAssignment.objects.get_or_create(vrf=vrf, prefix=prefix)
         return prefix
     except Exception as exc:
         logger.debug("Failed to ensure parent prefix %s: %s", prefix_cidr, exc)
@@ -1191,12 +1251,23 @@ def populate_device_from_snmp(device, info, config, ip_str=None):
     the Device primary IP (using the discovered prefix length).
 
     Returns:
-        dict with counts: interfaces_created, ip_addresses_created, vlans_created
+        dict with counts: interfaces_created, ip_addresses_created,
+        vrfs_created, vlans_created
     """
     if not info or not device:
-        return {"interfaces_created": 0, "ip_addresses_created": 0, "vlans_created": 0}
+        return {
+            "interfaces_created": 0,
+            "ip_addresses_created": 0,
+            "vrfs_created": 0,
+            "vlans_created": 0,
+        }
 
-    counts = {"interfaces_created": 0, "ip_addresses_created": 0, "vlans_created": 0}
+    counts = {
+        "interfaces_created": 0,
+        "ip_addresses_created": 0,
+        "vrfs_created": 0,
+        "vlans_created": 0,
+    }
     interfaces_data = info.get("interfaces") or []
     ip_addresses_data = info.get("ip_addresses") or []
 
@@ -1247,19 +1318,35 @@ def populate_device_from_snmp(device, info, config, ip_str=None):
             logger.debug("Failed to create interface %s on %s: %s", name, device.name, exc)
 
     active_ip_status = get_ip_address_status()
+    populate_vrfs = config.get("populate_vrfs", True)
+    created_vrfs = set()
     primary_ip_obj = None
     for ip_row in ip_addresses_data:
         address = ip_row.get("address")
         if not address:
             continue
         prefix = ip_row.get("prefix_length") or 32
+        vrf_name = (ip_row.get("vrf") or "").strip()
+        vrf_obj = None
+        namespace = get_default_namespace()
+        if vrf_name and populate_vrfs:
+            vrf_obj, vrf_created = ensure_vrf(vrf_name)
+            if vrf_created and vrf_name not in created_vrfs:
+                created_vrfs.add(vrf_name)
+                counts["vrfs_created"] += 1
+            vrf_ns = ensure_vrf_namespace(vrf_name)
+            if vrf_ns:
+                namespace = vrf_ns
         ip_str_full = f"{address}/{prefix}"
         try:
             # Nautobot 3.x: IPAddress must have a containing Prefix in its
             # Namespace, otherwise creation fails silently (0 IPs registered).
-            ensure_parent_prefix(address, prefix)
+            # VRF-tagged rows live in a per-VRF Namespace whose Prefixes are
+            # associated with the VRF, so the IP derives its VRF correctly.
+            ensure_parent_prefix(address, prefix, namespace=namespace, vrf=vrf_obj)
             ip_obj, created = IPAddress.objects.get_or_create(
                 address=ip_str_full,
+                namespace=namespace,
                 defaults={"status": active_ip_status},
             )
             if created:
@@ -1376,6 +1463,10 @@ class SNMPDiscoveryJob(Job):
         default=True,
         description="Create and assign ipam.IPAddress objects from the IP-MIB table.",
     )
+    populate_vrfs = BooleanVar(
+        default=True,
+        description="Create ipam.VRF objects and per-VRF Namespaces for VRF-tagged addresses.",
+    )
     include_neighbors = BooleanVar(
         default=True,
         description="Walk LLDP and CDP neighbor tables (recorded, not linked).",
@@ -1403,7 +1494,7 @@ class SNMPDiscoveryJob(Job):
     )
     dryrun = DryRunVar()
 
-    def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False):
+    def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, populate_vrfs=True, include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False):
         config = get_plugin_config()
         snmp_version = str(snmp_version or "2c").strip().lower()
         if snmp_version.startswith("v"):
@@ -1426,6 +1517,7 @@ class SNMPDiscoveryJob(Job):
         config["snmp_retries"] = 2
         config["populate_interfaces"] = populate_interfaces
         config["populate_ip_addresses"] = populate_ip_addresses
+        config["populate_vrfs"] = populate_vrfs
         config["include_neighbors"] = include_neighbors
         config["include_vlans"] = include_vlans
         config["populate_vlans"] = populate_vlans
@@ -1679,7 +1771,7 @@ def ssh_connect_and_discover(
 
     Returns:
         dict with hostname, vendor, model, serial, os_version, port,
-        command_outputs, raw_output
+        command_outputs, raw_output, vrfs, ip_addresses and counts
         or None on failure.
     """
     try:
@@ -1776,6 +1868,17 @@ def ssh_connect_and_discover(
         if not hostname:
             hostname = ip_str
 
+        # Run the data commands for IP/VRF collection (best effort).
+        data_commands = profile.get("data_commands") or list(GENERIC_DATA_COMMANDS)
+        for cmd in data_commands:
+            if cmd in command_outputs:
+                continue
+            out = _send_and_read(shell, cmd, timeout=timeout).decode("utf-8", errors="replace")
+            command_outputs[cmd] = out
+
+        vrfs = parse_ssh_vrfs(command_outputs, vendor)
+        ip_addresses = parse_ssh_ip_addresses(command_outputs, vendor)
+
         client.close()
 
         return {
@@ -1787,6 +1890,10 @@ def ssh_connect_and_discover(
             "port": port,
             "command_outputs": command_outputs,
             "raw_output": combined[:500],
+            "vrfs": vrfs,
+            "ip_addresses": ip_addresses,
+            "vrfs_found": len(vrfs),
+            "ip_addresses_found": len(ip_addresses),
         }
 
     except Exception as exc:
@@ -2096,6 +2203,10 @@ class FullDiscoveryJob(Job):
         default=True,
         description="Create and assign ipam.IPAddress objects from the SNMP IP-MIB table.",
     )
+    populate_vrfs = BooleanVar(
+        default=True,
+        description="Create ipam.VRF objects and per-VRF Namespaces for VRF-tagged addresses.",
+    )
     include_neighbors = BooleanVar(
         default=True,
         description="Walk SNMP LLDP and CDP neighbor tables (recorded, not linked).",
@@ -2136,11 +2247,12 @@ class FullDiscoveryJob(Job):
     )
 
     def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", ssh_username, ssh_password,
-            enable_ping, enable_snmp, enable_ssh, populate_interfaces=True, populate_ip_addresses=True,
+            enable_ping, enable_snmp, enable_ssh, populate_interfaces=True, populate_ip_addresses=True, populate_vrfs=True,
             include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False, timeout, concurrency):
         config = get_plugin_config()
         config["populate_interfaces"] = populate_interfaces
         config["populate_ip_addresses"] = populate_ip_addresses
+        config["populate_vrfs"] = populate_vrfs
         config["include_neighbors"] = include_neighbors
         config["include_vlans"] = include_vlans
         config["populate_vlans"] = populate_vlans
@@ -2477,6 +2589,10 @@ class CrawlDiscoveryJob(Job):
         default=True,
         description="Create and assign ipam.IPAddress objects from the IP-MIB table.",
     )
+    populate_vrfs = BooleanVar(
+        default=True,
+        description="Create ipam.VRF objects and per-VRF Namespaces for VRF-tagged addresses.",
+    )
     include_neighbors = BooleanVar(
         default=True,
         description="Walk LLDP and CDP neighbor tables and continue the crawl from them.",
@@ -2504,10 +2620,11 @@ class CrawlDiscoveryJob(Job):
     )
     dryrun = DryRunVar()
 
-    def run(self, *, seed_device, seed_ip="", max_depth, max_devices, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False):
+    def run(self, *, seed_device, seed_ip="", max_depth, max_devices, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, populate_vrfs=True, include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False):
         config = get_plugin_config()
         config["populate_interfaces"] = populate_interfaces
         config["populate_ip_addresses"] = populate_ip_addresses
+        config["populate_vrfs"] = populate_vrfs
         config["include_neighbors"] = include_neighbors
         config["include_vlans"] = include_vlans
         config["populate_vlans"] = populate_vlans

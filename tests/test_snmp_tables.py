@@ -7,6 +7,9 @@ from nautobot_plugin_device_auto_discovery import snmp_tables
 from nautobot_plugin_device_auto_discovery.mappings import lookup_interface_type
 from nautobot_plugin_device_auto_discovery.snmp_tables import (
     _auth_data,
+    _decode_ascii_index,
+    _format_rd,
+    _parse_ipaddress_table_index,
     build_snmp_auth,
     collect_arp_table,
     collect_cdp_neighbors,
@@ -16,6 +19,7 @@ from nautobot_plugin_device_auto_discovery.snmp_tables import (
     collect_physical,
     collect_system,
     collect_vlans,
+    collect_vrfs,
     discover_snmp_tables,
     find_chassis_model,
     find_chassis_serial,
@@ -144,10 +148,17 @@ class CollectIPAddressesTests(TestCase):
         self.assertEqual(by_addr["192.168.1.1"]["prefix_length"], 32)
 
     def test_ip_address_table_fallback(self):
+        # ipAddressTable index is ifIndex.ipAddressType.<addr octets>
         columns = _column_map(
             (snmp_tables.OID_IPADENTIFINDEX, {}),
             (snmp_tables.OID_IPADENTNETMASK, {}),
-            (snmp_tables.OID_IPADDRESSIFINDEX, {"2001:db8::1": "3", "10.0.0.5": "1"}),
+            (
+                snmp_tables.OID_IPADDRESSIFINDEX,
+                {
+                    "3.2.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1": "3",
+                    "1.1.10.0.0.5": "1",
+                },
+            ),
         )
         with patch(
             "nautobot_plugin_device_auto_discovery.snmp_tables.walk_columns",
@@ -156,8 +167,97 @@ class CollectIPAddressesTests(TestCase):
             addresses = collect_ip_addresses("192.0.2.1", CONFIG)
 
         self.assertEqual(len(addresses), 2)
-        self.assertEqual(addresses[0]["if_index"], "3")
-        self.assertIsNone(addresses[0]["prefix_length"])
+        by_addr = {a["address"]: a for a in addresses}
+        self.assertEqual(by_addr["2001:db8::1"]["if_index"], "3")
+        self.assertEqual(by_addr["2001:db8::1"]["prefix_length"], 128)
+        self.assertEqual(by_addr["10.0.0.5"]["prefix_length"], 32)
+        self.assertIsNone(by_addr["10.0.0.5"]["vrf"])
+
+    def test_ip_address_table_prefix_from_pointer(self):
+        columns = _column_map(
+            (snmp_tables.OID_IPADDRESSIFINDEX, {"1.1.192.0.2.1": "1", "2.1.192.0.2.5": "2"}),
+            (
+                snmp_tables.OID_IPADDRESSPREFIX,
+                {"1.1.192.0.2.1": "1.3.6.1.2.1.4.32.1.1.1.24.192.0.2.0"},
+            ),
+            (snmp_tables.OID_IPADDRESSPREFIXLENGTH, {"1.24.192.0.2.0": "24"}),
+        )
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.walk_columns",
+            side_effect=lambda ip_str, oid, *a, **k: columns.get(oid, {}),
+        ):
+            addresses = collect_ip_addresses("192.0.2.1", CONFIG)
+
+        by_addr = {a["address"]: a for a in addresses}
+        self.assertEqual(by_addr["192.0.2.1"]["prefix_length"], 24)
+        # No pointer -> host route fallback
+        self.assertEqual(by_addr["192.0.2.5"]["prefix_length"], 32)
+
+    def test_ip_address_context_tags_vrf(self):
+        columns = _column_map(
+            (snmp_tables.OID_IPADDRESSIFINDEX, {"1.1.10.0.0.5": "1"}),
+        )
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.walk_columns",
+            side_effect=lambda ip_str, oid, *a, **k: columns.get(oid, {}),
+        ):
+            addresses = collect_ip_addresses("192.0.2.1", CONFIG, context_name="RED")
+        self.assertEqual(addresses[0]["vrf"], "RED")
+
+    def test_parse_ipaddress_table_index(self):
+        self.assertEqual(_parse_ipaddress_table_index("1.1.10.0.0.5"), ("1", 1, "10.0.0.5"))
+        self.assertEqual(
+            _parse_ipaddress_table_index("3.2.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1"),
+            ("3", 2, "2001:db8::1"),
+        )
+        self.assertEqual(_parse_ipaddress_table_index("junk"), (None, None, None))
+        self.assertEqual(_parse_ipaddress_table_index("1.1.10.0"), (None, None, None))
+
+
+class CollectVRFTests(TestCase):
+    def test_collect_vrfs_merges_mibs(self):
+        columns = _column_map(
+            # mplsVpnVrfTable: index/value = VRF name octets
+            (snmp_tables.OID_MPLSVPNVRFNAME, {"82.69.68": "RED"}),
+            (snmp_tables.OID_MPLSVPNVRFDESCRIPTION, {"82.69.68": "Red VRF"}),
+            (snmp_tables.OID_MPLSVPNVRFRD, {"82.69.68": "1:100"}),
+            # mplsVpnInterfaceConfTable: index vrfName.ifIndex
+            (snmp_tables.OID_MPLSVPNINTERFACECONFINDEX, {"82.69.68.5": "5"}),
+            # Cisco CISCO-VRF-MIB classic
+            (snmp_tables.OID_CVRFVRFNAME, {"1": "GREEN"}),
+            # Cisco CISCO-VRF-MIB v2 (711)
+            (snmp_tables.OID_CVVRFNAME, {"1": "BLUE"}),
+            (snmp_tables.OID_CVVRFINTERFACEIFINDEX, {"1.2": "2"}),
+        )
+        with patch(
+            "nautobot_plugin_device_auto_discovery.snmp_tables.walk_columns",
+            side_effect=lambda ip_str, oid, *a, **k: columns.get(oid, {}),
+        ):
+            vrfs = collect_vrfs("192.0.2.1", CONFIG)
+
+        by_name = {v["name"]: v for v in vrfs}
+        self.assertEqual(set(by_name), {"RED", "GREEN", "BLUE"})
+        self.assertEqual(by_name["RED"]["rd"], "1:100")
+        self.assertEqual(by_name["RED"]["description"], "Red VRF")
+        self.assertEqual(by_name["RED"]["interfaces"], ["5"])
+        self.assertEqual(by_name["BLUE"]["interfaces"], ["2"])
+
+    def test_format_rd(self):
+        # Type 0: 2-byte type + 2-byte number + 4-byte IPv4
+        self.assertEqual(_format_rd("\x00\x00\x00\x64\xc0\x00\x02\x01"), "100:192.0.2.1")
+        # Type 1: 2-byte type + 2-byte ASN + 4-byte assigned number
+        self.assertEqual(_format_rd("\x00\x01\x00\x01\x00\x00\x30\x39"), "1:12345")
+        # 4-byte: 2-byte ASN + 2-byte number
+        self.assertEqual(_format_rd("\x00\x64\x00\x01"), "100:1")
+        # 3-byte: 1-byte type + 2-byte number
+        self.assertEqual(_format_rd("\x01\x00\x64"), "1:100")
+        # Pass-through
+        self.assertEqual(_format_rd("65000:10"), "65000:10")
+        self.assertEqual(_format_rd(""), "")
+
+    def test_decode_ascii_index(self):
+        self.assertEqual(_decode_ascii_index("82.69.68"), "RED")
+        self.assertEqual(_decode_ascii_index("82.69.68.5", drop_last=True), "RED")
 
 
 class CollectARPTests(TestCase):

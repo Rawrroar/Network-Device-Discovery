@@ -18,6 +18,9 @@ regexes (see ``ssh_connect_and_discover``).
 #     "commands": list of identification commands to run,
 #     "data_commands": list of extra commands run for IP/VRF data collection
 #         (output is parsed by parse_ssh_vrfs / parse_ssh_ip_addresses),
+#     "route_commands": list of commands run for route table data collection
+#         (output is parsed by parse_ssh_routes; may include per-VRF templates
+#          with {vrf} placeholder filled at runtime),
 #     "parsers": {
 #         "hostname": [regex...],
 #         "model":    [regex...],
@@ -35,6 +38,7 @@ SSH_PROFILES = {
         "pre_commands": ["terminal length 0"],
         "commands": ["show version", "show inventory"],
         "data_commands": ["show ip vrf", "show ip interface brief", "show ipv6 interface brief"],
+        "route_commands": ["show ip route", "show ip route vrf {vrf}"],
         "parsers": {
             "hostname": [
                 r"(?:hostname|host)\s+(\S+)",
@@ -64,6 +68,7 @@ SSH_PROFILES = {
         "pre_commands": ["set cli screen-length 0", "set cli screen-width 0"],
         "commands": ["show version", "show chassis hardware"],
         "data_commands": ["show routing-instances", "show interfaces terse"],
+        "route_commands": ["show route", "show route table {vrf}.inet.0"],
         "parsers": {
             "hostname": [
                 r"Hostname:\s*(\S+)",
@@ -90,6 +95,7 @@ SSH_PROFILES = {
         "pre_commands": ["terminal length 0"],
         "commands": ["show version"],
         "data_commands": ["show vrf", "show ip interface brief"],
+        "route_commands": ["show ip route", "show ip route vrf {vrf}"],
         "parsers": {
             "hostname": [
                 r"(?:hostname|host)\s+(\S+)",
@@ -114,6 +120,7 @@ SSH_PROFILES = {
         "pre_commands": ["screen-length disable"],
         "commands": ["display version", "display device manuinfo"],
         "data_commands": ["display ip vpn-instance", "display ip interface"],
+        "route_commands": ["display ip routing-table", "display ip routing-table vpn-instance {vrf}"],
         "parsers": {
             "hostname": [
                 r"^\s*(\S+)\s*\[.*?\]\s*$",
@@ -144,6 +151,7 @@ SSH_PROFILES = {
         "pre_commands": ["environment no more"],
         "commands": ["show system version", "show system information", "show chassis"],
         "data_commands": ["show router instance", "show router interface"],
+        "route_commands": ["show router route-table", "show router {vrf} route-table"],
         "parsers": {
             "hostname": [
                 r"System Name\s*[:\s]+(\S+)",
@@ -170,6 +178,7 @@ SSH_PROFILES = {
         "pre_commands": ["config system console", "set output standard", "end"],
         "commands": ["get system status"],
         "data_commands": ["get system interface"],
+        "route_commands": ["get router info routing-table all"],
         "parsers": {
             "hostname": [
                 r"Hostname\s*[:\s]+(\S+)",
@@ -195,6 +204,7 @@ SSH_PROFILES = {
         "pre_commands": ["set cli pager off", "set cli pagination off"],
         "commands": ["show system info"],
         "data_commands": ["show interface all"],
+        "route_commands": ["show routing route"],
         "parsers": {
             "hostname": [
                 r"hostname\s*[:\s]+(\S+)",
@@ -220,6 +230,7 @@ SSH_PROFILES = {
         "pre_commands": ["terminal length 0"],
         "commands": ["show version"],
         "data_commands": ["ip addr", "show ip interface brief", "show ipv6 interface brief"],
+        "route_commands": ["ip route", "show ip route"],
         "parsers": {
             "hostname": [
                 r"(?:hostname|host)\s+(\S+)",
@@ -252,4 +263,10 @@ GENERIC_INFO_COMMANDS = [
 # Data commands attempted for devices without a vendor profile (e.g. Linux).
 GENERIC_DATA_COMMANDS = [
     "ip addr",
+]
+
+# Route commands attempted for devices without a vendor profile.
+GENERIC_ROUTE_COMMANDS = [
+    "ip route",
+    "show ip route",
 ]

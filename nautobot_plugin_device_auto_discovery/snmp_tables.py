@@ -9,6 +9,7 @@ common MIB tables used during discovery:
   IPv4 and IPv6) and ARP (net-to-media) table
 - VRF tables: MPLS-VPN-MIB mplsVpnVrfTable plus both revisions of the
   Cisco CISCO-VRF-MIB, with optional per-context (per-VRF) IP walking
+- IP-FORWARD-MIB inetCidrRouteTable (route/prefix data, per-VRF context)
 - ENTITY-MIB physical inventory (used for serial numbers)
 - LLDP-MIB and CISCO-CDP-MIB neighbor tables
 - Q-BRIDGE-MIB dot1qVlanStaticTable (VLAN IDs and names)
@@ -124,6 +125,15 @@ OID_CDPCACHEDEVICEID = OID_CDPCACHETABLE + ".6"
 OID_CDPCACHEDEVICEPORT = OID_CDPCACHETABLE + ".7"
 OID_CDPCACHEPLATFORM = OID_CDPCACHETABLE + ".8"
 OID_CDPCACHEADDRESS = OID_CDPCACHETABLE + ".9"
+
+# IP-FORWARD-MIB (RFC 4292) - inetCidrRouteTable
+# Index: destType(.1) dest(.2) pfxLen(.3) policy(.4) nhopType(.5) nhop(.6)
+OID_INETCIDRROUTETABLE = "1.3.6.1.2.1.4.24.7"
+OID_INETCIDRROUTEIFINDEX = OID_INETCIDRROUTETABLE + ".1.7"
+OID_INETCIDRROUTETYPE = OID_INETCIDRROUTETABLE + ".1.8"
+OID_INETCIDRROUTEPROTO = OID_INETCIDRROUTETABLE + ".1.9"
+OID_INETCIDRROUTEAGE = OID_INETCIDRROUTETABLE + ".1.10"
+OID_INETCIDRROUTEMETRIC1 = OID_INETCIDRROUTETABLE + ".1.12"
 
 # Q-BRIDGE-MIB (RFC 4363) dot1qVlanStaticTable (index = dot1qVlanIndex / VLAN ID)
 OID_VLANSTATICTABLE = "1.3.6.1.2.1.17.7.1.4.2.1"
@@ -1153,6 +1163,143 @@ def collect_vlans(ip_str, config, max_rows=1000):
     return vlans
 
 
+def collect_routes(ip_str, config, max_rows=5000, context_name=""):
+    """Collect IP routes from the IP-FORWARD-MIB inetCidrRouteTable.
+
+    Walks the current-standard ``inetCidrRouteTable`` (RFC 4292). The
+    composite index encodes destination type/address/prefix-length,
+    policy, and next-hop type/address; this function parses those index
+    components to produce readable route entries.
+
+    When ``context_name`` is set (SNMPv3), the walk is performed inside
+    that SNMP context (typically a VRF name) and every returned row is
+    tagged with ``vrf=context_name``.
+
+    Returns:
+        list of dicts: {dest, prefix_length, next_hop, protocol, if_index,
+                        route_type, metric, vrf}
+    """
+    auth = build_snmp_auth(config)
+    timeout = config.get("snmp_timeout", 3)
+    retries = config.get("snmp_retries", 2)
+    if context_name:
+        auth = dict(auth)
+        auth["context"] = context_name
+
+    proto_map = {
+        "1": "other",
+        "2": "local",
+        "3": "netmgmt",
+        "4": "icmp",
+        "8": "egp",
+        "9": "ggp",
+        "11": "hello",
+        "13": "ospf",
+        "14": "bgp",
+        "16": "eigrp",
+        "20": "isis",
+        "21": "isisL1",
+        "22": "isisL2",
+        "23": "isisL1a",
+        "24": "isisL2a",
+        "26": "static",
+    }
+    type_map = {"1": "other", "2": "reject", "3": "local", "4": "remote", "5": "blackhole"}
+
+    ifindex_map = walk_columns(ip_str, OID_INETCIDRROUTEIFINDEX, auth, timeout, retries, max_rows)
+    type_map_vals = walk_columns(ip_str, OID_INETCIDRROUTETYPE, auth, timeout, retries, max_rows)
+    proto_map_vals = walk_columns(ip_str, OID_INETCIDRROUTEPROTO, auth, timeout, retries, max_rows)
+    metric_map = walk_columns(ip_str, OID_INETCIDRROUTEMETRIC1, auth, timeout, retries, max_rows)
+
+    if not ifindex_map and not type_map_vals:
+        return []
+
+    routes = []
+    for suffix in ifindex_map:
+        parsed = _parse_inetcidr_route_index(suffix)
+        if not parsed:
+            continue
+        dest, prefix_length, next_hop = parsed
+        routes.append(
+            {
+                "dest": dest,
+                "prefix_length": prefix_length,
+                "next_hop": next_hop,
+                "protocol": proto_map.get(proto_map_vals.get(suffix, ""), proto_map_vals.get(suffix, "")),
+                "if_index": ifindex_map.get(suffix, ""),
+                "route_type": type_map.get(type_map_vals.get(suffix, ""), type_map_vals.get(suffix, "")),
+                "metric": int(float(metric_map[suffix])) if suffix in metric_map else None,
+                "vrf": context_name or None,
+            }
+        )
+    return routes
+
+
+def _parse_inetcidr_route_index(suffix):
+    """Parse an inetCidrRouteTable composite index suffix.
+
+    Index format: ``destType.dest.pfxLen.policy.nhopType.nhop`` where
+    destType/nhopType 1 = IPv4, 2 = IPv6. IPv4 addresses are encoded
+    as 4 dotted octets; IPv6 as 16 single-byte sub-identifiers.
+
+    Returns:
+        tuple (dest_address, prefix_length, next_hop_address) or None.
+    """
+    parts = str(suffix).split(".")
+    if len(parts) < 7:
+        return None
+    try:
+        dest_type = int(parts[0])
+    except (TypeError, ValueError):
+        return None
+    # Determine address length based on type
+    if dest_type == 1:
+        dest_octets = 4
+    elif dest_type == 2:
+        dest_octets = 16
+    else:
+        return None
+    # Need: 1(destType) + dest_octets + 1(pfxLen) + 1(policy=OID=2+) + 1(nhopType) + nhop_octets
+    if dest_type == 1:
+        # parts: destType(1) + dest(4) + pfxLen(1) + policy(2+) + nhopType(1) + nhop(4)
+        # Minimum: 1+4+1+2+1+4 = 13
+        if len(parts) < 13:
+            return None
+        dest = ".".join(parts[1:5])
+        try:
+            prefix_length = int(parts[5])
+        except (TypeError, ValueError):
+            return None
+        # Policy is an OID; skip it. nhopType is after policy.
+        # Find nhopType: after destType(1) + dest(4) + pfxLen(1) = index 6
+        # policy OID has variable length; nhopType is the next integer after the OID
+        # For IPv4, nhopType + nhop(4) is last 5 elements
+        nhop_type = int(parts[-5])
+        next_hop = ".".join(parts[-4:])
+    elif dest_type == 2:
+        # IPv6: 1+16+1+2+1+16 = 37 minimum
+        if len(parts) < 37:
+            return None
+        try:
+            from netaddr import IPAddress as _IPAddress
+            dest_bytes = bytes(int(p) for p in parts[1:17])
+            dest = str(_IPAddress(dest_bytes))
+        except (TypeError, ValueError, IndexError):
+            return None
+        try:
+            prefix_length = int(parts[17])
+        except (TypeError, ValueError):
+            return None
+        try:
+            nhop_bytes = bytes(int(p) for p in parts[-16:])
+            next_hop = str(_IPAddress(nhop_bytes))
+        except (TypeError, ValueError, IndexError):
+            next_hop = "::"
+    else:
+        return None
+    return dest, prefix_length, next_hop
+
+
 # ------------------------------------------------------------------ #
 #  Orchestrator                                                       #
 # ------------------------------------------------------------------ #
@@ -1164,8 +1311,8 @@ def discover_snmp_tables(ip_str, config):
     Each collector is isolated so a single failure only drops one table.
 
     Returns:
-        dict with keys: system, interfaces, ip_addresses, vrfs, arp_table,
-        physical, neighbors, vlans
+        dict with keys: system, interfaces, ip_addresses, vrfs, routes,
+        arp_table, physical, neighbors, vlans
     """
     max_rows = config.get("max_walk_oids", 1000)
     include_neighbors = config.get("include_neighbors", True)
@@ -1176,6 +1323,7 @@ def discover_snmp_tables(ip_str, config):
         "interfaces": [],
         "ip_addresses": [],
         "vrfs": [],
+        "routes": [],
         "arp_table": [],
         "physical": [],
         "neighbors": [],
@@ -1231,6 +1379,27 @@ def discover_snmp_tables(ip_str, config):
                 if row.get("vrf"):
                     row["vrf"] = vrf_name
             tables["ip_addresses"].extend(context_ips)
+
+    # Collect routes from inetCidrRouteTable. For SNMPv3, walk per-VRF context
+    # so routes inside VRFs are tagged with the correct VRF name.
+    try:
+        tables["routes"] = collect_routes(ip_str, config, max_rows=max_rows)
+    except Exception as exc:
+        logger.debug("SNMP route collection failed for %s: %s", ip_str, exc)
+
+    if tables["vrfs"] and str(config.get("snmp_version", "2c")).strip().lower() == "3":
+        for vrf in tables["vrfs"]:
+            vrf_name = vrf.get("name")
+            if not vrf_name:
+                continue
+            try:
+                context_routes = collect_routes(
+                    ip_str, config, max_rows=max_rows, context_name=vrf_name
+                )
+            except Exception as exc:
+                logger.debug("SNMP context route collection failed for %s vrf %s: %s", ip_str, vrf_name, exc)
+                continue
+            tables["routes"].extend(context_routes)
 
     try:
         tables["arp_table"] = collect_arp_table(ip_str, config, max_rows=max_rows)

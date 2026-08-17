@@ -45,13 +45,14 @@ from nautobot.dcim.models import (
 from nautobot.extras.models import Role
 from nautobot.extras.models import Status, Tag
 from nautobot.ipam.models import IPAddress, Namespace, Prefix, VLAN, VLANGroup, VRF, VRFPrefixAssignment
+from nautobot.tenancy.models import Tenant
 
 from .models import DiscoveryProfile, DiscoveryResult, DiscoveryScan, DiscoveredDevice
 from .correlation import correlate_device
 from .mappings import lookup_platform_from_oid
 from .snmp_tables import discover_snmp_tables, find_chassis_model, find_chassis_serial, snmp_get
-from .ssh_parsing import parse_ssh_vrfs, parse_ssh_ip_addresses
-from .ssh_profiles import SSH_PROFILES, GENERIC_INFO_COMMANDS, GENERIC_DATA_COMMANDS
+from .ssh_parsing import parse_ssh_vrfs, parse_ssh_ip_addresses, parse_ssh_routes
+from .ssh_profiles import SSH_PROFILES, GENERIC_INFO_COMMANDS, GENERIC_DATA_COMMANDS, GENERIC_ROUTE_COMMANDS
 from .utils import strip_domain_suffixes
 
 # Common SNMP constants kept for backward compatibility
@@ -1107,8 +1108,11 @@ def ensure_vrf_namespace(vrf_name):
         return None
 
 
-def ensure_vrf(vrf_name):
+def ensure_vrf(vrf_name, tenant=None):
     """Find-or-create an ipam.VRF object within its own per-VRF Namespace.
+
+    When ``tenant`` is provided (a ``tenancy.Tenant`` instance), the VRF
+    is assigned to that tenant.
 
     Returns:
         tuple (VRF object or None, bool created).
@@ -1118,11 +1122,14 @@ def ensure_vrf(vrf_name):
     namespace = ensure_vrf_namespace(vrf_name)
     if not namespace:
         return None, False
+    defaults = {"status": get_vrf_status()}
+    if tenant:
+        defaults["tenant"] = tenant
     try:
         vrf, created = VRF.objects.get_or_create(
             name=vrf_name,
             namespace=namespace,
-            defaults={"status": get_vrf_status()},
+            defaults=defaults,
         )
         return vrf, created
     except Exception as exc:
@@ -1150,7 +1157,7 @@ def network_prefix_for(address, prefix_length):
         return None
 
 
-def ensure_parent_prefix(address, prefix_length, namespace=None, vrf=None):
+def ensure_parent_prefix(address, prefix_length, namespace=None, vrf=None, tenant=None):
     """Find-or-create a Network Prefix able to parent an IP address.
 
     Nautobot 3.x requires every IPAddress to have a containing Prefix in its
@@ -1164,17 +1171,22 @@ def ensure_parent_prefix(address, prefix_length, namespace=None, vrf=None):
     VRF-to-Prefix association as a dedicated record, not a Prefix field), so
     the resulting IPAddress derives its VRF from its parent Prefix.
 
+    When ``tenant`` is given, the Prefix is assigned to that tenant.
+
     Returns:
         Prefix object, or None on failure.
     """
     prefix_cidr = network_prefix_for(address, prefix_length)
     if not prefix_cidr:
         return None
+    defaults = {"status": get_prefix_status()}
+    if tenant:
+        defaults["tenant"] = tenant
     try:
         prefix, _ = Prefix.objects.get_or_create(
             prefix=prefix_cidr,
             namespace=namespace or get_default_namespace(),
-            defaults={"status": get_prefix_status()},
+            defaults=defaults,
         )
         if vrf:
             VRFPrefixAssignment.objects.get_or_create(vrf=vrf, prefix=prefix)
@@ -2808,11 +2820,435 @@ class CrawlDiscoveryJob(Job):
         }
 
 
-# Register all job classes
+class VRFRouteDiscoveryJob(Job):
+    """Discover VRFs, route prefixes, and IP addresses from network devices.
+
+    Connects to devices via SNMP and/or SSH to extract VRF names, route
+    table entries (prefixes/subnets), and associated IP addresses. Creates
+    ipam.VRF, ipam.Prefix, and ipam.IPAddress objects in Nautobot. Optionally
+    assigns all discovered VRFs to a selected tenancy.Tenant.
+    """
+
+    class Meta:
+        name = "VRF & Route Discovery"
+        dryrun_default = True
+        has_sensitive_variables = True
+        soft_time_limit = 1800
+        time_limit = 3600
+        template_name = "nautobot_plugin_device_auto_discovery/snmp_job_form.html"
+
+    target_network = IPNetworkVar(
+        description="Target network in CIDR notation (e.g. 10.0.0.0/24).",
+    )
+    snmp_version = ChoiceVar(
+        default="2c",
+        choices=[("1", "SNMPv1"), ("2c", "SNMPv2c"), ("3", "SNMPv3")],
+        description="SNMP version.",
+    )
+    snmp_community = StringVar(
+        default="public",
+        description="SNMP community string (v1/v2c).",
+    )
+    snmpv3_username = StringVar(
+        default="",
+        description="SNMPv3 username.",
+        required=False,
+    )
+    snmpv3_auth_protocol = StringVar(
+        default="SHA",
+        description="SNMPv3 authentication protocol.",
+        required=False,
+    )
+    snmpv3_auth_key = StringVar(
+        default="",
+        description="SNMPv3 authentication key.",
+        required=False,
+    )
+    snmpv3_priv_protocol = StringVar(
+        default="AES",
+        description="SNMPv3 privacy protocol.",
+        required=False,
+    )
+    snmpv3_priv_key = StringVar(
+        default="",
+        description="SNMPv3 privacy key.",
+        required=False,
+    )
+    snmpv3_context_name = StringVar(
+        default="",
+        description="SNMPv3 context name (leave empty for default context).",
+        required=False,
+    )
+    ssh_enabled = BooleanVar(
+        default=True,
+        description="Enable SSH route/VRF extraction.",
+    )
+    ssh_username = StringVar(
+        default="",
+        description="SSH username (leave empty to use plugin config default).",
+        required=False,
+    )
+    ssh_password = StringVar(
+        default="",
+        description="SSH password.",
+        required=False,
+    )
+    ssh_port = IntegerVar(
+        default=22,
+        min_value=1,
+        max_value=65535,
+        description="SSH port.",
+    )
+    timeout = IntegerVar(
+        default=10,
+        min_value=3,
+        max_value=60,
+        description="Connection timeout in seconds.",
+    )
+    concurrency = IntegerVar(
+        default=10,
+        min_value=1,
+        max_value=50,
+        description="Maximum concurrent device connections.",
+    )
+    populate_vrfs = BooleanVar(
+        default=True,
+        description="Create ipam.VRF objects in Nautobot.",
+    )
+    populate_prefixes = BooleanVar(
+        default=True,
+        description="Create ipam.Prefix objects for discovered routes/prefixes.",
+    )
+    tenant = ObjectVar(
+        model=Tenant,
+        required=False,
+        description="Optional tenant to assign all discovered VRFs and prefixes to.",
+    )
+    dryrun = DryRunVar()
+
+    def run(self, target_network, snmp_version, snmp_community, *args, **kwargs):
+        """Execute VRF and route table discovery across the target network."""
+        config = get_plugin_config()
+
+        # Override config with job-level variables
+        config["snmp_version"] = snmp_version
+        config["snmp_community"] = snmp_community
+        config["snmpv3_username"] = kwargs.get("snmpv3_username", "")
+        config["snmpv3_auth_protocol"] = kwargs.get("snmpv3_auth_protocol", "SHA")
+        config["snmpv3_auth_key"] = kwargs.get("snmpv3_auth_key", "")
+        config["snmpv3_priv_protocol"] = kwargs.get("snmpv3_priv_protocol", "AES")
+        config["snmpv3_priv_key"] = kwargs.get("snmpv3_priv_key", "")
+        config["snmpv3_context_name"] = kwargs.get("snmpv3_context_name", "")
+        ssh_enabled = kwargs.get("ssh_enabled", True)
+        ssh_username = kwargs.get("ssh_username", "") or config.get("ssh_username", "")
+        ssh_password = kwargs.get("ssh_password", "") or config.get("ssh_password", "")
+        ssh_port = kwargs.get("ssh_port", 22)
+        timeout = kwargs.get("timeout", 10)
+        concurrency = kwargs.get("concurrency", 10)
+        populate_vrfs = kwargs.get("populate_vrfs", True)
+        populate_prefixes = kwargs.get("populate_prefixes", True)
+        tenant_obj = kwargs.get("tenant")
+        dryrun = kwargs.get("dryrun", False)
+
+        config["snmp_timeout"] = min(timeout, 10)
+        enable_password = config.get("ssh_enable_password", "")
+
+        # Resolve tenant if specified
+        tenant_instance = None
+        if tenant_obj:
+            try:
+                tenant_instance = Tenant.objects.get(pk=tenant_obj.pk) if hasattr(tenant_obj, "pk") else Tenant.objects.filter(name=str(tenant_obj)).first()
+            except Exception:
+                tenant_instance = None
+
+        # Expand target network into individual IPs
+        network = IPNetwork(str(target_network))
+        all_ips = [str(host) for host in network.iter_hosts()]
+        if not all_ips:
+            all_ips = [str(network.network)]
+
+        self.logger.info(
+            "Starting VRF & route discovery on %s (%d hosts), SNMP v%s, SSH %s, dryrun=%s",
+            target_network,
+            len(all_ips),
+            snmp_version,
+            "enabled" if ssh_enabled else "disabled",
+            dryrun,
+        )
+
+        # Create the scan record
+        discovery_scan = DiscoveryScan.objects.create(
+            name=f"VRF & Route Discovery - {target_network}",
+            scan_method="vrf",
+            target_network=str(network.network) if len(all_ips) == 1 else None,
+            status="running",
+        )
+
+        # Per-host counters
+        lock = threading.Lock()
+        total_vrfs = 0
+        total_routes = 0
+        scanned = 0
+        failed = 0
+
+        def _scan_host(ip_str):
+            nonlocal total_vrfs, total_routes, scanned, failed
+
+            snmp_success = False
+            ssh_success = False
+            vrfs_data = []
+            routes_data = []
+            ip_data = []
+
+            # --- SNMP phase ---
+            try:
+                tables = discover_snmp_tables(ip_str, config)
+                if tables.get("vrfs") or tables.get("routes") or tables.get("ip_addresses"):
+                    snmp_success = True
+                vrfs_data = tables.get("vrfs", [])
+                routes_data = tables.get("routes", [])
+                ip_data = tables.get("ip_addresses", [])
+            except Exception as exc:
+                self.logger.debug("SNMP failed for %s: %s", ip_str, exc)
+
+            # --- SSH phase ---
+            if ssh_enabled and not dryrun:
+                try:
+                    ssh_result = ssh_connect_and_discover(
+                        ip_str,
+                        username=ssh_username,
+                        password=ssh_password,
+                        timeout=timeout,
+                        banner_timeout=30,
+                        port=ssh_port,
+                        enable_password=enable_password,
+                        port_check=True,
+                    )
+                    if ssh_result:
+                        ssh_success = True
+                        # Merge VRFs (SSH preferred for completeness)
+                        ssh_vrfs = ssh_result.get("vrfs", [])
+                        if ssh_vrfs:
+                            existing_names = {v["name"] for v in vrfs_data}
+                            for sv in ssh_vrfs:
+                                if sv["name"] not in existing_names:
+                                    vrfs_data.append(sv)
+
+                        # Collect route data via SSH
+                        ssh_routes = self._ssh_collect_routes(
+                            ip_str, ssh_result, vrfs_data, ssh_username, ssh_password,
+                            ssh_port, timeout, enable_password,
+                        )
+                        if ssh_routes:
+                            routes_data.extend(ssh_routes)
+
+                        # Merge IP addresses
+                        ssh_ips = ssh_result.get("ip_addresses", [])
+                        if ssh_ips:
+                            ip_data.extend(ssh_ips)
+                except Exception as exc:
+                    self.logger.debug("SSH failed for %s: %s", ip_str, exc)
+
+            if not snmp_success and not ssh_success:
+                with lock:
+                    failed += 1
+                self.logger.debug("No SNMP or SSH response from %s", ip_str)
+                return
+
+            # --- Create Nautobot objects ---
+            if not dryrun:
+                self._create_vrf_and_prefix_objects(
+                    ip_str, vrfs_data, routes_data, ip_data,
+                    populate_vrfs, populate_prefixes, tenant_instance,
+                )
+            with lock:
+                total_vrfs += len(vrfs_data)
+                total_routes += len(routes_data)
+                scanned += 1
+
+            if dryrun:
+                self.logger.info(
+                    "[DRYRUN] %s: %d VRFs, %d routes, %d IP addresses",
+                    ip_str, len(vrfs_data), len(routes_data), len(ip_data),
+                )
+
+        # Execute with thread pool
+        with ThreadPoolExecutor(max_workers=min(concurrency, len(all_ips))) as executor:
+            futures = {executor.submit(_scan_host, ip): ip for ip in all_ips}
+            for future in as_completed(futures):
+                ip = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    self.logger.error("Host %s raised: %s", ip, exc)
+                    with lock:
+                        failed += 1
+
+        # Finalize scan record
+        discovery_scan.devices_discovered = scanned
+        discovery_scan.status = "completed"
+        discovery_scan.save()
+
+        self.logger.info(
+            "VRF & route discovery complete: %d hosts scanned, %d VRFs, %d routes, %d failed",
+            scanned,
+            total_vrfs,
+            total_routes,
+            failed,
+        )
+
+        return {
+            "scan": discovery_scan.pk,
+            "target_network": str(target_network),
+            "hosts_scanned": scanned,
+            "hosts_failed": failed,
+            "vrfs_found": total_vrfs,
+            "routes_found": total_routes,
+            "tenant": str(tenant_instance) if tenant_instance else None,
+            "dryrun": dryrun,
+        }
+
+    def _ssh_collect_routes(self, ip_str, ssh_result, snmp_vrfs, username, password, port, timeout, enable_password):
+        """Run vendor-specific route commands over SSH and parse the output.
+
+        Executes the global route command plus per-VRF route commands for
+        each VRF discovered via SNMP or SSH.
+        """
+        routes = []
+        try:
+            import paramiko
+        except ImportError:
+            return routes
+
+        vendor = ssh_result.get("vendor", "")
+        profile = SSH_PROFILES.get(vendor) or {}
+        route_commands = profile.get("route_commands") or list(GENERIC_ROUTE_COMMANDS)
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        try:
+            client.connect(
+                hostname=ip_str, port=port, username=username, password=password,
+                timeout=timeout, banner_timeout=30,
+                look_for_keys=False, allow_agent=False,
+            )
+            shell = client.invoke_shell()
+            shell.settimeout(timeout)
+            _read_until_prompt(shell, timeout=timeout)
+
+            # Disable paging
+            for cmd in profile.get("pre_commands", []):
+                _send_and_read(shell, cmd, timeout=timeout)
+
+            # Enable mode if needed
+            if profile.get("requires_enable"):
+                out = _send_and_read(shell, "enable", timeout=timeout).decode("utf-8", errors="replace")
+                if "password" in out.lower() and enable_password:
+                    time.sleep(0.3)
+                    _send_and_read(shell, enable_password, timeout=timeout)
+
+            command_outputs = {}
+
+            # Run global route command
+            for cmd in route_commands:
+                if "{vrf}" in cmd:
+                    continue  # Skip per-VRF commands in this pass
+                out = _send_and_read(shell, cmd, timeout=timeout).decode("utf-8", errors="replace")
+                command_outputs[cmd] = out
+
+            # Run per-VRF route commands
+            for vrf in snmp_vrfs:
+                vrf_name = vrf.get("name", "")
+                if not vrf_name:
+                    continue
+                for cmd_template in route_commands:
+                    if "{vrf}" not in cmd_template:
+                        continue
+                    cmd = cmd_template.replace("{vrf}", vrf_name)
+                    out = _send_and_read(shell, cmd, timeout=timeout).decode("utf-8", errors="replace")
+                    command_outputs[cmd] = out
+
+            routes = parse_ssh_routes(command_outputs, vendor)
+            client.close()
+        except Exception as exc:
+            self.logger.debug("SSH route collection failed for %s: %s", ip_str, exc)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+        return routes
+
+    def _create_vrf_and_prefix_objects(
+        self, ip_str, vrfs_data, routes_data, ip_data,
+        populate_vrfs, populate_prefixes, tenant_instance,
+    ):
+        """Create VRF, Prefix, and IPAddress objects from discovered data."""
+        # Create VRFs
+        vrf_map = {}  # vrf_name -> VRF object
+        if populate_vrfs:
+            for vrf_row in vrfs_data:
+                vrf_name = vrf_row.get("name", "")
+                if not vrf_name:
+                    continue
+                vrf, _ = ensure_vrf(vrf_name, tenant=tenant_instance)
+                if vrf:
+                    vrf_map[vrf_name] = vrf
+
+        # Create Prefixes from route data
+        if populate_prefixes:
+            seen_prefixes = set()
+            for route in routes_data:
+                dest = route.get("dest", "")
+                pfx_len = route.get("prefix_length")
+                vrf_name = route.get("vrf")
+                if not dest or pfx_len is None:
+                    continue
+                prefix_cidr = network_prefix_for(dest, pfx_len)
+                if not prefix_cidr or prefix_cidr in seen_prefixes:
+                    continue
+                seen_prefixes.add(prefix_cidr)
+
+                vrf_obj = vrf_map.get(vrf_name) if vrf_name else None
+                namespace = vrf_obj.namespace if vrf_obj else None
+                ensure_parent_prefix(
+                    dest, pfx_len,
+                    namespace=namespace,
+                    vrf=vrf_obj,
+                    tenant=tenant_instance,
+                )
+
+        # Create Prefixes and IPAddresses from IP address data
+        if ip_data:
+            for ip_row in ip_data:
+                address = ip_row.get("address", "")
+                prefix_length = ip_row.get("prefix_length", 32)
+                vrf_name = ip_row.get("vrf")
+                if not address:
+                    continue
+                vrf_obj = vrf_map.get(vrf_name) if vrf_name else None
+                namespace = vrf_obj.namespace if vrf_obj else get_default_namespace()
+                ensure_parent_prefix(
+                    address, prefix_length,
+                    namespace=namespace,
+                    vrf=vrf_obj,
+                    tenant=tenant_instance,
+                )
+                try:
+                    IPAddress.objects.get_or_create(
+                        host=address,
+                        namespace=namespace,
+                        defaults={"status": get_ip_address_status()},
+                    )
+                except Exception as exc:
+                    self.logger.debug("Failed to create IPAddress %s: %s", address, exc)
 register_jobs(
     PingSweepJob,
     SNMPDiscoveryJob,
     SSHDiscoveryJob,
     FullDiscoveryJob,
     CrawlDiscoveryJob,
+    VRFRouteDiscoveryJob,
 )

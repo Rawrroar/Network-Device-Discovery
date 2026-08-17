@@ -33,6 +33,7 @@ DEFAULT_PLUGINS_CONFIG = {
     "populate_ip_addresses": True,
     "populate_vrfs": True,
     "populate_vlans": True,
+    "populate_routes": True,
     "include_neighbors": True,
     "include_vlans": True,
     "max_walk_oids": 1000,

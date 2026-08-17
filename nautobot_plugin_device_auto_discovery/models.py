@@ -15,6 +15,7 @@ class DiscoveryScan(PrimaryModel):
         SSH = "ssh", "SSH Discovery"
         FULL = "full", "Full Discovery (Ping + SNMP + SSH)"
         CRAWL = "crawl", "Crawl Discovery (seed device + neighbors)"
+        VRF = "vrf", "VRF & Route Discovery"
 
     name = models.CharField(
         max_length=100,

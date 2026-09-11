@@ -417,6 +417,12 @@ Every discovered IP is recorded as a persistent `DiscoveredDevice` row and match
 
 The **Create devices** job input controls auto-creation: when disabled (e.g. profile review mode), `new` devices are recorded but not created. Correlation statuses are persisted on the `DiscoveredDevice` record and mirrored onto the `DiscoveryResult` (`new` / `existing` / `partial` / `conflict`).
 
+The **Discovered Devices** list view groups records into status tabs —
+**Imported**, **New**, **Conflicts** (Partially Imported + Conflict),
+**Not Reachable**, **Failed**, and **All** — each with a live count, so
+devices needing attention are immediately visible. The active tab can be
+combined with the standard search and filter controls.
+
 ### API Usage
 
 Jobs can also be triggered via the REST API:

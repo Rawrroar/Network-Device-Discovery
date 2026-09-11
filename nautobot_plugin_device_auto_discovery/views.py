@@ -193,6 +193,59 @@ class DiscoveredDeviceUIViewSet(NautobotUIViewSet):
     )
     serializer_class = serializers.DiscoveredDeviceSerializer
     table_class = tables.DiscoveredDeviceTable
+
+    # Status tabs shown above the list (mirrors the Device Discovery app:
+    # Imported / New / Conflicts grouping partially_imported + conflict).
+    STATUS_TABS = (
+        ("imported", "Imported", ("imported",)),
+        ("new", "New", ("new",)),
+        ("conflicts", "Conflicts", ("partially_imported", "conflict")),
+        ("not_reachable", "Not Reachable", ("not_reachable",)),
+        ("failed", "Failed", ("failed",)),
+        ("all", "All", None),
+    )
+
+    def filter_queryset(self, queryset):
+        """Apply the status tab (``?tab=<key>``) before standard filtering."""
+        tab = self.request.GET.get("tab", "")
+        self.active_tab = tab if any(key == tab for key, _label, _statuses in self.STATUS_TABS) else ""
+        if self.active_tab and self.active_tab != "all":
+            statuses = next(s for key, _l, s in self.STATUS_TABS if key == self.active_tab)
+            queryset = queryset.filter(status__in=statuses)
+        return super().filter_queryset(queryset)
+
+    @property
+    def status_tab_definitions(self):
+        """Tab definitions for the list template.
+
+        Each entry carries a pre-built ``querystring`` that preserves the
+        current filters while switching to that tab (dropping the previous
+        ``tab``/``page`` params).
+        """
+        params = self.request.GET.copy() if hasattr(self, "request") else {}
+        params.pop("tab", None)
+        params.pop("page", None)
+        base = params.urlencode()
+        tabs = []
+        for key, label, _statuses in self.STATUS_TABS:
+            if key == "all":
+                querystring = base
+            else:
+                querystring = f"{base}&tab={key}" if base else f"tab={key}"
+            tabs.append({"key": key, "label": label, "querystring": querystring})
+        return tabs
+
+    @property
+    def discovered_device_tab_counts(self):
+        """Per-tab record counts (unfiltered by the tab itself)."""
+        counts = {}
+        base = self.queryset
+        for key, _label, statuses in self.STATUS_TABS:
+            if statuses is None:
+                counts[key] = base.count()
+            else:
+                counts[key] = base.filter(status__in=statuses).count()
+        return counts
     object_detail_content = ObjectDetailContent(
         panels=(
             ObjectFieldsPanel(

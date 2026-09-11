@@ -1,5 +1,22 @@
 {% extends "generic/object_list.html" %}
 
+{% load helpers %}
+
+{% block content %}
+    {{ block.super }}
+{% endblock %}
+
+{% block table %}
+    <ul class="nav nav-tabs" style="margin-bottom: 10px;">
+        {% for tab in view.status_tab_definitions %}
+            <li role="presentation" class="{% if tab.key == view.active_tab or tab.key == 'all' and not view.active_tab %}active{% endif %}">
+                <a href="?{{ tab.querystring }}">{{ tab.label }} <span class="badge">{{ view.discovered_device_tab_counts|get_item:tab.key }}</span></a>
+            </li>
+        {% endfor %}
+    </ul>
+    {{ block.super }}
+{% endblock %}
+
 {% block bulk_buttons %}
     {{ block.super }}
     {% if perms.nautobot_plugin_device_auto_discovery.change_discovereddevice %}

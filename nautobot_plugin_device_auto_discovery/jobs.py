@@ -55,6 +55,7 @@ from .secrets import (
     record_ssh_success,
     snmp_secrets_config,
     ssh_credential_candidates,
+    ssh_credential_candidates_for_group,
     ssh_credential_from_config,
     ssh_connect_with_credentials,
 )
@@ -786,6 +787,76 @@ def upsert_discovered_device(ip_str, info, method, config, *, device, result_sta
         defaults["ssh_port"] = config.get("ssh_port")
 
     return DiscoveredDevice.objects.update_or_create(ip_address=ip_str, defaults=defaults)[0]
+
+
+# ------------------------------------------------------------------ #
+#  Fast Path (SSH collection short-circuit)                            #
+# ------------------------------------------------------------------ #
+
+
+def fast_path_eligible(discovered_device, info):
+    """Decide whether a device may skip SSH platform/credential discovery.
+
+    Mirrors the Nautobot Device Discovery app's Fast Path: after SNMP has
+    identified a device, SSH collection may go straight to data collection
+    (skipping platform auto-detection and credential iteration) when:
+
+    - SNMP succeeded and reports platform, hostname, and serial,
+    - the stored DiscoveredDevice identity matches all three exactly,
+    - the last SSH collection succeeded (``ssh_collection`` is True), and
+    - a valid last-known-working SSH secrets group is on file.
+
+    Returns:
+        (True, candidate_dict) when eligible, else (False, reason_string).
+    """
+    if discovered_device is None:
+        return False, "no stored device record"
+
+    identity = {
+        "platform": (info.get("platform_info") or {}).get("platform_name", ""),
+        "hostname": info.get("hostname", ""),
+        "serial": info.get("serial", ""),
+    }
+    if not all(identity.values()):
+        return False, "SNMP identity incomplete"
+
+    stored = {
+        "platform": discovered_device.network_driver or "",
+        "hostname": discovered_device.hostname or "",
+        "serial": discovered_device.serial or "",
+    }
+    for attribute, value in identity.items():
+        if str(value).strip().lower() != str(stored[attribute]).strip().lower():
+            return False, f"{attribute} mismatch (SNMP {value!r} != stored {stored[attribute]!r})"
+
+    if not discovered_device.ssh_collection:
+        return False, "no previous successful SSH collection"
+
+    group = discovered_device.ssh_secrets_group
+    if group is None:
+        return False, "no stored SSH secrets group"
+
+    candidate = ssh_credential_candidates_for_group(group)
+    if candidate is None:
+        return False, "stored SSH secrets group is no longer usable"
+    return True, candidate
+
+
+def mark_fast_path_failure(ip_str, reason):
+    """Disable Fast Path for the next run after a failed direct collection.
+
+    Marks SSH as Not Reachable (clearing the successful-collection flag and
+    the stored secrets group) so the next run performs full discovery —
+    platform detection, credential iteration — and self-corrects.
+    """
+    now = timezone.now()
+    DiscoveredDevice.objects.filter(ip_address=ip_str).update(
+        ssh_collection=False,
+        ssh_collection_datetime=None,
+        ssh_collection_attempt_datetime=now,
+        ssh_issue=f"Fast Path failure: {reason}"[:500],
+        ssh_secrets_group=None,
+    )
 
 
 def finalize_discovery(scan, ip_str, method, info, config, *, auto_create=True, dryrun=False):
@@ -2413,6 +2484,24 @@ class FullDiscoveryJob(Job):
 
         self.logger.info("Starting full discovery of %s", network)
 
+        fast_path = bool(config.get("fast_path")) and enable_snmp and enable_ssh
+        if fast_path:
+            self.logger.info("Fast Path enabled: SSH collection will skip platform/credential discovery where possible")
+
+        # Fast Path eligibility compares SNMP results against the stored
+        # state from BEFORE this run — snapshot it before Phase 2 updates
+        # the DiscoveredDevice records.
+        pre_scan_state = {}
+        if fast_path:
+            for field_ip in DiscoveredDevice.objects.filter(ip_address__in=all_hosts):
+                pre_scan_state[field_ip.ip_address] = {
+                    "hostname": field_ip.hostname,
+                    "serial": field_ip.serial,
+                    "network_driver": field_ip.network_driver,
+                    "ssh_collection": field_ip.ssh_collection,
+                    "ssh_secrets_group": field_ip.ssh_secrets_group,
+                }
+
         live_hosts = set()
         discovered_hosts = set()
         total_discovered = 0
@@ -2420,6 +2509,8 @@ class FullDiscoveryJob(Job):
         total_existing = 0
         total_conflicts = 0
         total_failed = 0
+        fast_path_used = 0
+        fast_path_failures = 0
 
         # Phase 1: Ping Sweep
         if enable_ping:
@@ -2498,12 +2589,13 @@ class FullDiscoveryJob(Job):
 
             lock = threading.Lock()
 
-            def ssh_scan(ip_str):
+            def _collect_and_finalize(ip_str, candidates, via_fast_path):
                 nonlocal total_discovered, total_created, total_existing, total_conflicts, total_failed
+                nonlocal fast_path_used, fast_path_failures
                 try:
                     info, candidate = ssh_connect_with_credentials(
                         ip_str,
-                        ssh_candidates,
+                        candidates,
                         ssh_connect_and_discover,
                         timeout=timeout,
                         banner_timeout=config.get("ssh_banner_timeout", 30),
@@ -2512,11 +2604,26 @@ class FullDiscoveryJob(Job):
                         port_check=config.get("ssh_port_check", True),
                     )
                     if not info:
+                        if via_fast_path:
+                            # Self-correction: stored assumptions were wrong
+                            # (hardware replaced, platform drifted, credential
+                            # rotated); disable Fast Path for the next run and
+                            # fall back to full discovery right away.
+                            with lock:
+                                fast_path_failures += 1
+                            mark_fast_path_failure(ip_str, "direct SSH collection failed")
+                            self.logger.warning(
+                                "Fast Path: direct SSH collection failed for %s; falling back to full discovery",
+                                ip_str,
+                            )
+                            _collect_and_finalize(ip_str, ssh_candidates, False)
                         return
                     record_ssh_success(DiscoveredDevice.objects.filter(ip_address=ip_str).first(), candidate)
 
                     with lock:
                         total_discovered += 1
+                        if via_fast_path:
+                            fast_path_used += 1
 
                     result_status, device, error, created_now = finalize_discovery(
                         discovery_scan,
@@ -2539,7 +2646,8 @@ class FullDiscoveryJob(Job):
                             total_conflicts += 1
 
                     self.logger.info(
-                        "SSH: %s -> %s (%s)%s",
+                        "SSH%s: %s -> %s (%s)%s",
+                        " fast-path" if via_fast_path else "",
                         ip_str, info["hostname"], result_status,
                         " [dry-run]" if dryrun else "",
                     )
@@ -2549,6 +2657,24 @@ class FullDiscoveryJob(Job):
                         total_failed += 1
                     self.logger.error("SSH error for %s: %s", ip_str, exc)
 
+            def ssh_scan(ip_str):
+                stored = pre_scan_state.get(ip_str)
+                if stored:
+                    # Reconstruct a transient snapshot for the eligibility
+                    # check without re-querying the (now updated) DB record.
+                    snapshot = type("StoredState", (), {})()
+                    snapshot.network_driver = stored["network_driver"]
+                    snapshot.hostname = stored["hostname"]
+                    snapshot.serial = stored["serial"]
+                    snapshot.ssh_collection = stored["ssh_collection"]
+                    snapshot.ssh_secrets_group = stored["ssh_secrets_group"]
+                    eligible, value = fast_path_eligible(snapshot, snmp_results[ip_str])
+                    if eligible:
+                        _collect_and_finalize(ip_str, [value], True)
+                        return
+                    self.logger.debug("Fast Path skipped for %s: %s", ip_str, value)
+                _collect_and_finalize(ip_str, ssh_candidates, False)
+
             with ThreadPoolExecutor(max_workers=min(concurrency, 10)) as executor:
                 futures = {executor.submit(ssh_scan, ip_str): ip_str for ip_str in ssh_targets}
                 for future in as_completed(futures):
@@ -2556,6 +2682,13 @@ class FullDiscoveryJob(Job):
                         future.result()
                     except Exception:
                         pass
+
+            if fast_path_used or fast_path_failures:
+                self.logger.info(
+                    "Fast Path: %d device(s) collected directly, %d failure(s) triggered self-correction",
+                    fast_path_used,
+                    fast_path_failures,
+                )
 
         # Finalize
         cables_created = 0
@@ -2589,6 +2722,8 @@ class FullDiscoveryJob(Job):
             "conflicts": total_conflicts,
             "failed": total_failed,
             "cables_created": cables_created,
+            "fast_path_used": fast_path_used,
+            "fast_path_failures": fast_path_failures,
         }
 
 

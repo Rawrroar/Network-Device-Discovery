@@ -24,6 +24,7 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - **DiscoveryProfiles** — reusable scan-scope and settings (prefixes, exclusions, IP cap, ports, timeouts, domain stripping) applied to the SNMP, Full, and Crawl jobs
 - **Secrets-based credentials** — SSH and SNMP credentials resolved from weighted Secrets Groups assigned to a profile; the last-known-working SSH group is remembered per device, and SNMPv3 security levels are derived from the secrets present (no credentials in `PLUGINS_CONFIG`)
 - **Automated classification** — weighted rules map hostname patterns and IP scopes to Location/Role/Tenant for Not Imported devices, recomputed automatically after scans and rule changes
+- **Fast Path** — recurring Full Discovery runs skip SSH platform/credential discovery for devices whose SNMP identity matches stored state, with automatic self-correction on failure
 - **Inventory correlation** — each discovered IP is matched against Nautobot by primary IP, hostname, and serial, and persisted on a `DiscoveredDevice` record as `imported`, `new`, `partially_imported`, or `conflict`
 - Compatible with Nautobot v3.x
 
@@ -221,7 +222,7 @@ A visited set (keyed on IP) plus the depth and device caps keep the crawl finite
 - `protocols` — which methods to use (`ping`, `snmp`, `ssh`)
 - `ssh_port` / `snmp_port` / `snmp_timeout` / `snmp_retries` — transport settings (profile values take precedence over job defaults)
 - `snmpv3_auth_protocol` / `snmpv3_priv_protocol` — default SNMPv3 algorithms
-- `fast_path` — reserved for the fast-path optimization
+- `fast_path` — skip SSH platform/credential discovery on recurring scans when SNMP identity matches stored state (see Fast Path)
 - `strip_domain_suffixes` — domain suffixes stripped from discovered hostnames (case-insensitive, longest match wins, dot boundary required)
 
 ### Secrets & Credential Management
@@ -295,6 +296,38 @@ Example — classify Location from a site code in hostnames like `ams-core-01`:
 | Match Against | `dcim.location` |
 | Match Field | `name` |
 | Match Operator | `iexact` |
+
+### Fast Path
+
+Fast Path optimizes recurring **Full Discovery** scans in mature environments
+where devices rarely change. It applies only to the SSH collection phase —
+SNMP always runs the same way.
+
+Enable it via the `fast_path` flag on a DiscoveryProfile. After the SNMP
+phase, for each host that SSH still needs to cover, the job compares the
+SNMP-identified identity against the stored `DiscoveredDevice` record:
+
+| Attribute | Must match stored value? |
+|-----------|--------------------------|
+| Platform (`network_driver`) | Yes |
+| Hostname | Yes |
+| Serial number | Yes |
+
+When all three match exactly (case-insensitive), the last SSH collection
+succeeded, and a valid last-known-working SSH Secrets Group is on file, the
+job **skips platform auto-detection and credential iteration** and collects
+SSH data directly with the stored credentials.
+
+**Self-correction:** if the direct collection fails (hardware replaced,
+platform migrated, credentials rotated), the job immediately falls back to
+full discovery for that host, clears the stored SSH success state, and marks
+the issue — so the next run performs full discovery and the device becomes
+Fast Path eligible again automatically. No permanent false assumptions, no
+manual intervention.
+
+Avoid Fast Path during initial onboarding or frequent credential rotation;
+the first successful full run primes the stored state that makes a device
+eligible.
 
 ### Inventory Correlation
 

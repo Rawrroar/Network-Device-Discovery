@@ -143,6 +143,26 @@ def ssh_credential_from_config(config):
     return candidate
 
 
+def ssh_credential_candidates_for_group(group, config=None):
+    """Build a single SSH credential candidate from one specific secrets group.
+
+    Used by the Fast Path to collect data with the stored last-known-working
+    credentials only — no iteration, no fallback.
+
+    Returns:
+        candidate dict, or None when the group has no usable SSH username.
+    """
+    if group is None:
+        return None
+    username = _get_secret(group, _SSH_ACCESS_TYPE, SecretsGroupSecretTypeChoices.TYPE_USERNAME)
+    if not username:
+        return None
+    password = _get_secret(group, _SSH_ACCESS_TYPE, SecretsGroupSecretTypeChoices.TYPE_PASSWORD)
+    candidate = dict(config or {})
+    candidate.update({"username": username, "password": password or "", "secrets_group": group})
+    return candidate
+
+
 def ssh_connect_with_credentials(ip_str, candidates, connect_func, **connect_kwargs):
     """Try each SSH credential candidate in order until one succeeds.
 
@@ -198,6 +218,7 @@ __all__ = [
     "record_ssh_success",
     "snmp_secrets_config",
     "ssh_credential_candidates",
+    "ssh_credential_candidates_for_group",
     "ssh_credential_from_config",
     "ssh_connect_with_credentials",
 ]

@@ -42,6 +42,18 @@ class DiscoveryProfileSecretsGroupAssignmentForm(NautobotModelForm):
         fields = "__all__"
 
 
+class DeviceClassificationRuleForm(NautobotModelForm):
+    class Meta:
+        model = models.DeviceClassificationRule
+        fields = "__all__"
+
+
+class DiscoveredDeviceClassificationForm(NautobotModelForm):
+    class Meta:
+        model = models.DiscoveredDeviceClassification
+        fields = "__all__"
+
+
 # ---------------------------------------------------------------------------
 # Filter forms (sidebar)
 # ---------------------------------------------------------------------------
@@ -123,6 +135,35 @@ class DiscoveredDeviceFilterForm(NautobotFilterForm):
     )
 
 
+class DeviceClassificationRuleFilterForm(NautobotFilterForm):
+    model = models.DeviceClassificationRule
+    q = forms.CharField(required=False, label="Search")
+    classify_as = forms.ChoiceField(
+        choices=[
+            ("location", "Location"),
+            ("role", "Role"),
+            ("tenant", "Tenant"),
+        ],
+        required=False,
+        label="Classify As",
+    )
+    is_active = forms.NullBooleanField(required=False, label="Active")
+
+
+class DiscoveredDeviceClassificationFilterForm(NautobotFilterForm):
+    model = models.DiscoveredDeviceClassification
+    q = forms.CharField(required=False, label="Search")
+    classify_as = forms.ChoiceField(
+        choices=[
+            ("location", "Location"),
+            ("role", "Role"),
+            ("tenant", "Tenant"),
+        ],
+        required=False,
+        label="Classify As",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bulk edit forms
 # ---------------------------------------------------------------------------
@@ -181,3 +222,25 @@ class DiscoveryProfileSecretsGroupAssignmentBulkEditForm(NautobotBulkEditForm):
     class Meta:
         model = models.DiscoveryProfileSecretsGroupAssignment
         fields = ["weight"]
+
+
+class DeviceClassificationRuleBulkEditForm(NautobotBulkEditForm):
+    pk = forms.ModelMultipleChoiceField(
+        queryset=models.DeviceClassificationRule.objects.all(),
+        widget=forms.MultipleHiddenInput(),
+    )
+
+    class Meta:
+        model = models.DeviceClassificationRule
+        fields = ["weight", "is_active"]
+
+
+class DiscoveredDeviceClassificationBulkEditForm(NautobotBulkEditForm):
+    pk = forms.ModelMultipleChoiceField(
+        queryset=models.DiscoveredDeviceClassification.objects.all(),
+        widget=forms.MultipleHiddenInput(),
+    )
+
+    class Meta:
+        model = models.DiscoveredDeviceClassification
+        fields = []

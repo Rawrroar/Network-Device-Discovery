@@ -5,10 +5,12 @@ same filtering logic without duplication.
 """
 
 from nautobot_plugin_device_auto_discovery.api.filtersets import (
+    DeviceClassificationRuleFilterSet,
     DiscoveryProfileFilterSet,
     DiscoveryProfileSecretsGroupAssignmentFilterSet,
     DiscoveryResultFilterSet,
     DiscoveryScanFilterSet,
+    DiscoveredDeviceClassificationFilterSet,
     DiscoveredDeviceFilterSet,
 )
 
@@ -18,4 +20,6 @@ __all__ = [
     "DiscoveryProfileFilterSet",
     "DiscoveredDeviceFilterSet",
     "DiscoveryProfileSecretsGroupAssignmentFilterSet",
+    "DeviceClassificationRuleFilterSet",
+    "DiscoveredDeviceClassificationFilterSet",
 ]

@@ -32,6 +32,17 @@ menu_items = (
                         ),
                     ),
                     NavMenuItem(
+                        link=f"plugins:{APP}:deviceclassificationrule_list",
+                        name="Classification Rules",
+                        permissions=[f"{APP}.view_deviceclassificationrule"],
+                        buttons=(
+                            NavMenuAddButton(
+                                link=f"plugins:{APP}:deviceclassificationrule_add",
+                                permissions=[f"{APP}.add_deviceclassificationrule"],
+                            ),
+                        ),
+                    ),
+                    NavMenuItem(
                         link=f"plugins:{APP}:discoveryscan_list",
                         name="Discovery Scans",
                         permissions=[f"{APP}.view_discoveryscan"],

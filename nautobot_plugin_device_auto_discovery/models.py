@@ -497,3 +497,191 @@ class DiscoveredDevice(PrimaryModel):
 
     def __str__(self):
         return f"{self.hostname or self.ip_address} ({self.get_status_display()})"
+
+
+class DeviceClassificationRule(PrimaryModel):
+    """Derive a Location, Role, or Tenant for Not Imported discovered devices.
+
+    Rules are grouped by ``classify_as`` target and evaluated in weight
+    order (ascending, then name). For each target the first enabled rule
+    that produces a single unambiguous match wins — zero or multiple
+    matches are treated as no match.
+    """
+
+    class ClassifyAs(models.TextChoices):
+        LOCATION = "location", "Location"
+        ROLE = "role", "Role"
+        TENANT = "tenant", "Tenant"
+
+    class Transform(models.TextChoices):
+        LOWERCASE = "lowercase", "Lowercase"
+        UPPERCASE = "uppercase", "Uppercase"
+
+    # classify_as value -> (app_label, model_name) it must be matched against.
+    TARGET_MODEL_MAP = {
+        ClassifyAs.LOCATION: ("dcim", "location"),
+        ClassifyAs.ROLE: ("extras", "role"),
+        ClassifyAs.TENANT: ("tenancy", "tenant"),
+    }
+
+    name = models.CharField(max_length=200, unique=True)
+    description = models.CharField(max_length=500, blank=True, default="")
+    classify_as = models.CharField(
+        max_length=20,
+        choices=ClassifyAs.choices,
+        help_text="Which discovered-device field this rule populates.",
+    )
+    weight = models.PositiveSmallIntegerField(
+        default=1000,
+        help_text="Lower weight = higher priority within the same classify_as target.",
+    )
+    source_pattern = models.CharField(
+        max_length=500,
+        help_text=(
+            "Regular expression applied to the source field; must contain a named "
+            "'(?P<value>...)' capture group whose value is used in the lookup."
+        ),
+    )
+    match_against = models.CharField(
+        max_length=100,
+        help_text="Content-type of the model to match against (e.g. 'dcim.location', 'extras.role', 'tenancy.tenant').",
+    )
+    match_field = models.CharField(
+        max_length=100,
+        default="name",
+        help_text="Field on the matched model to compare the extracted value against.",
+    )
+    match_operator = models.CharField(
+        max_length=20,
+        default="iexact",
+        choices=[
+            ("iexact", "iexact"),
+            ("exact", "exact"),
+            ("icontains", "icontains"),
+            ("istartswith", "istartswith"),
+            ("iendswith", "iendswith"),
+        ],
+        help_text="How the extracted value is compared to the match field.",
+    )
+    match_filters = models.JSONField(
+        encoder=django.core.serializers.json.DjangoJSONEncoder,
+        blank=True,
+        default=dict,
+        help_text=(
+            "Optional equality filters narrowing the lookup, e.g. "
+            "{\"status__name\": \"Active\"}. Up to two foreign-key traversals."
+        ),
+    )
+    ip_scope = models.JSONField(
+        encoder=django.core.serializers.json.DjangoJSONEncoder,
+        blank=True,
+        default=list,
+        help_text="Optional list of CIDR prefixes restricting this rule to devices with an IP in scope.",
+    )
+    transform = models.CharField(
+        max_length=20,
+        blank=True,
+        choices=Transform.choices,
+        help_text="Optional transformation applied to the extracted value before lookup.",
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Only active rules are evaluated.",
+    )
+
+    class Meta:
+        ordering = ("classify_as", "weight", "name")
+
+    def __str__(self):
+        return self.name
+
+    def clean(self):
+        """Validate pattern, target/model compatibility, and match filters."""
+        from django.core.exceptions import ValidationError
+
+        super().clean()
+
+        if self.source_pattern and "(?P<value>" not in self.source_pattern:
+            raise ValidationError({"source_pattern": "Pattern must contain a named capture group '(?P<value>...)'"})
+        try:
+            import re
+
+            re.compile(self.source_pattern)
+        except re.error as exc:
+            raise ValidationError({"source_pattern": f"Invalid regular expression: {exc}"}) from exc
+
+        expected = self.TARGET_MODEL_MAP.get(self.classify_as)
+        if expected:
+            actual = (self.match_against or "").lower().strip()
+            if actual not in (f"{expected[0]}.{expected[1]}", f"{expected[0]}.{expected[1]}s"):
+                raise ValidationError(
+                    {
+                        "match_against": (
+                            f"'{self.match_against}' is incompatible with classify_as "
+                            f"'{self.classify_as}'; expected '{expected[0]}.{expected[1]}'"
+                        )
+                    }
+                )
+
+        for key in (self.match_filters or {}):
+            depth = key.count("__") - 1 if key.endswith(("name", "id", "pk")) else key.count("__")
+            if key.count("__") > 2 or depth > 2:
+                raise ValidationError({"match_filters": f"Filter '{key}' exceeds two foreign-key traversals"})
+
+    def compile(self):
+        """Return ``(compiled_regex, lookup_suffix, queryset_filters)`` for the engine."""
+        import re
+
+        return re.compile(self.source_pattern), self.match_operator, dict(self.match_filters or {})
+
+
+class DiscoveredDeviceClassification(BaseModel):
+    """Pre-computed Location/Role/Tenant suggestions for a Not Imported device.
+
+    One row per (device, classify_as) target produced by the classification
+    engine; records the winning rule and a human-readable reason. Rows are
+    deleted when the device leaves the Not Imported state.
+    """
+
+    class ClassifyAs(models.TextChoices):
+        LOCATION = "location", "Location"
+        ROLE = "role", "Role"
+        TENANT = "tenant", "Tenant"
+
+    discovered_device = models.ForeignKey(
+        to="nautobot_plugin_device_auto_discovery.DiscoveredDevice",
+        on_delete=models.CASCADE,
+        related_name="classifications",
+        help_text="The discovered device this classification applies to.",
+    )
+    classify_as = models.CharField(max_length=20, choices=ClassifyAs.choices)
+    matched_object_type = models.ForeignKey(
+        to="contenttypes.ContentType",
+        on_delete=models.SET_NULL,
+        related_name="+",
+        blank=True,
+        null=True,
+        help_text="Content-type of the matched object (location/role/tenant).",
+    )
+    matched_object_id = models.UUIDField(blank=True, null=True)
+    matched_rule = models.ForeignKey(
+        to="nautobot_plugin_device_auto_discovery.DeviceClassificationRule",
+        on_delete=models.SET_NULL,
+        related_name="classifications",
+        blank=True,
+        null=True,
+        help_text="The rule that produced this classification.",
+    )
+    reason = models.CharField(
+        max_length=500,
+        blank=True,
+        default="",
+        help_text="Human-readable explanation, e.g. \"Rule 'X': extracted 'ams' from 'hostname' — matched location name='ams'\".",
+    )
+
+    class Meta:
+        unique_together = ("discovered_device", "classify_as")
+        ordering = ("discovered_device", "classify_as")
+
+    def __str__(self):
+        return f"{self.discovered_device}: {self.classify_as}"

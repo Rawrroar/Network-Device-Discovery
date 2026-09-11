@@ -36,7 +36,7 @@ DEFAULT_PLUGINS_CONFIG = {
 class DeviceAutoDiscoveryConfig(NautobotAppConfig):
     name = "nautobot_plugin_device_auto_discovery"
     verbose_name = "Device Auto-Discovery"
-    version = "0.4.0"
+    version = "0.5.0"
     author = "Developer"
     author_email = "dev@example.com"
     description = "Automatic network device discovery via ICMP ping, SNMP, and SSH."
@@ -53,6 +53,8 @@ class DeviceAutoDiscoveryConfig(NautobotAppConfig):
         super().ready()
         # Import jobs so they are registered at startup
         import nautobot_plugin_device_auto_discovery.jobs  # noqa: F401
+        # Register classification signal handlers
+        from . import signals  # noqa: F401
 
 
 config = DeviceAutoDiscoveryConfig

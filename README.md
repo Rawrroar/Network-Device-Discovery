@@ -23,6 +23,7 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - **Crawl Discovery** — iteratively discovers devices from a seed device by following LLDP/CDP neighbors hop by hop
 - **DiscoveryProfiles** — reusable scan-scope and settings (prefixes, exclusions, IP cap, ports, timeouts, domain stripping) applied to the SNMP, Full, and Crawl jobs
 - **Secrets-based credentials** — SSH and SNMP credentials resolved from weighted Secrets Groups assigned to a profile; the last-known-working SSH group is remembered per device, and SNMPv3 security levels are derived from the secrets present (no credentials in `PLUGINS_CONFIG`)
+- **Automated classification** — weighted rules map hostname patterns and IP scopes to Location/Role/Tenant for Not Imported devices, recomputed automatically after scans and rule changes
 - **Inventory correlation** — each discovered IP is matched against Nautobot by primary IP, hostname, and serial, and persisted on a `DiscoveredDevice` record as `imported`, `new`, `partially_imported`, or `conflict`
 - Compatible with Nautobot v3.x
 
@@ -252,6 +253,49 @@ All secret values are fetched through the secrets **provider** at query time
 in the plugin. When no profile secrets group applies, jobs fall back to
 explicit job inputs.
 
+### Automated Device Classification
+
+After a scan, devices with status **Not Imported** (`new`) need a Location,
+Role, and optionally a Tenant before onboarding. **Classification Rules**
+derive those values automatically from device hostnames and/or IP scopes —
+no separate job to run, results are recomputed in the background whenever a
+scan completes or a rule changes.
+
+A rule describes how to derive a single classification target — Location,
+Role, or Tenant — for a Not Imported device:
+
+| Field | Purpose |
+|-------|---------|
+| **Classify As** | Which device field this rule populates: Location, Role, or Tenant |
+| **Weight** | Lower weight = higher priority; the first matching enabled rule per target wins |
+| **Source Pattern** | Regex with a named `(?P<value>...)` capture group applied to the hostname (case-insensitive) |
+| **Match Against** | The Nautobot model the value is matched against — must be Location, Role, or Tenant |
+| **Match Field / Operator** | How the extracted value is compared (e.g. `name` + `iexact`) |
+| **Match Filters** | Extra equality filters, e.g. `{"status__name": "Active"}` (max two FK traversals) |
+| **IP Scope** | Optional list of prefixes restricting the rule to a subset of devices |
+| **Transform** | Optional `lowercase` / `uppercase` applied to the extracted value |
+
+A lookup only produces a classification when it returns **exactly one**
+candidate — zero or multiple matches are treated as no match, since
+incorrect auto-assignment is worse than none. Classification never modifies
+devices or triggers onboarding; it only records suggestions:
+
+1. Create rules under **Devices > Discovery > Classification Rules**
+2. Run any discovery job — Not Imported devices are classified automatically
+3. Review the **Automated Classification** panel on a device's detail view
+   (or enable the Classification columns on the list view) and use the
+   suggestions to fill in Location/Role/Tenant when onboarding
+
+Example — classify Location from a site code in hostnames like `ams-core-01`:
+
+| Field | Value |
+|-------|-------|
+| Classify As | Location |
+| Source Pattern | `^(?P<value>[a-z]{2,4})-` |
+| Match Against | `dcim.location` |
+| Match Field | `name` |
+| Match Operator | `iexact` |
+
 ### Inventory Correlation
 
 Every discovered IP is recorded as a persistent `DiscoveredDevice` row and matched against the Nautobot inventory using three identifying attributes:
@@ -286,6 +330,8 @@ The plugin also exposes its own REST API under `/api/plugins/device-auto-discove
 | `/discovery-profiles/` | `DiscoveryProfile` — reusable scan-scope bundles |
 | `/discovered-devices/` | `DiscoveredDevice` — per-IP correlation ledger |
 | `/discovery-profile-secrets-groups/` | `DiscoveryProfileSecretsGroupAssignment` — weighted credentials per profile |
+| `/classification-rules/` | `DeviceClassificationRule` — hostname/IP-scope → Location/Role/Tenant rules |
+| `/discovered-device-classifications/` | `DiscoveredDeviceClassification` — computed classification results |
 
 Each endpoint supports the standard Nautobot queryset actions (list, retrieve, create,
 update, delete) and is searchable via the `q` parameter.

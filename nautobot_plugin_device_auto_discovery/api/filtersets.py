@@ -84,3 +84,23 @@ class DiscoveryProfileSecretsGroupAssignmentFilterSet(NautobotFilterSet):
     class Meta:
         model = models.DiscoveryProfileSecretsGroupAssignment
         fields = ("discovery_profile", "secrets_group", "weight")
+
+
+class DeviceClassificationRuleFilterSet(NautobotFilterSet):
+    """FilterSet for DeviceClassificationRule objects."""
+
+    q = SearchFilter(filter_predicates={"name": "icontains", "description": "icontains"})
+
+    class Meta:
+        model = models.DeviceClassificationRule
+        fields = ("name", "classify_as", "match_against", "weight", "is_active")
+
+
+class DiscoveredDeviceClassificationFilterSet(NautobotFilterSet):
+    """FilterSet for DiscoveredDeviceClassification objects."""
+
+    q = SearchFilter(filter_predicates={"discovered_device__hostname": "icontains", "reason": "icontains"})
+
+    class Meta:
+        model = models.DiscoveredDeviceClassification
+        fields = ("discovered_device", "classify_as", "matched_rule")

@@ -10,5 +10,7 @@ router.register("discovery-results", views.DiscoveryResultUIViewSet)
 router.register("discovery-profiles", views.DiscoveryProfileUIViewSet)
 router.register("discovered-devices", views.DiscoveredDeviceUIViewSet)
 router.register("discovery-profile-secrets-groups", views.DiscoveryProfileSecretsGroupAssignmentUIViewSet)
+router.register("classification-rules", views.DeviceClassificationRuleUIViewSet)
+router.register("discovered-device-classifications", views.DiscoveredDeviceClassificationUIViewSet)
 
 urlpatterns = router.urls

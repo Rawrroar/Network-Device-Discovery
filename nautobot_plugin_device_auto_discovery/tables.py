@@ -1,4 +1,4 @@
-"""UI tables for the Device Auto-Discovery plugin."""
+﻿"""UI tables for the Device Auto-Discovery plugin."""
 
 import django_tables2 as tables
 from nautobot.apps.tables import BaseTable
@@ -85,6 +85,15 @@ class DiscoveredDeviceTable(BaseTable):
     vendor = tables.Column()
     device = tables.LinkColumn(verbose_name="Nautobot Device")
     last_seen = tables.DateTimeColumn(verbose_name="Last Seen")
+    classification_location = tables.Column(
+        verbose_name="Classification Location", accessor="pk", orderable=False, default=""
+    )
+    classification_role = tables.Column(
+        verbose_name="Classification Role", accessor="pk", orderable=False, default=""
+    )
+    classification_tenant = tables.Column(
+        verbose_name="Classification Tenant", accessor="pk", orderable=False, default=""
+    )
 
     class Meta:
         model = models.DiscoveredDevice
@@ -99,9 +108,27 @@ class DiscoveredDeviceTable(BaseTable):
             "ssh_collection",
             "ssh_secrets_group",
             "snmp_secrets_group",
+            "classification_location",
+            "classification_role",
+            "classification_tenant",
             "last_seen",
         )
         default_columns = ("hostname", "ip_address", "status", "vendor", "device", "last_seen")
+
+    def _classification_value(self, record, classify_as):
+        for classification in getattr(record, "_classification_cache", []) or []:
+            if classification.classify_as == classify_as:
+                return str(classification.matched_rule)
+        return ""
+
+    def render_classification_location(self, record):
+        return self._classification_value(record, "location")
+
+    def render_classification_role(self, record):
+        return self._classification_value(record, "role")
+
+    def render_classification_tenant(self, record):
+        return self._classification_value(record, "tenant")
 
 
 class DiscoveryProfileSecretsGroupAssignmentTable(BaseTable):
@@ -112,3 +139,32 @@ class DiscoveryProfileSecretsGroupAssignmentTable(BaseTable):
         model = models.DiscoveryProfileSecretsGroupAssignment
         fields = ("discovery_profile", "secrets_group", "weight", "created")
         default_columns = ("discovery_profile", "secrets_group", "weight")
+
+
+class DeviceClassificationRuleTable(BaseTable):
+    name = tables.LinkColumn()
+    classify_as = tables.Column(verbose_name="Classify As")
+
+    class Meta:
+        model = models.DeviceClassificationRule
+        fields = (
+            "name",
+            "classify_as",
+            "weight",
+            "source_pattern",
+            "match_against",
+            "match_field",
+            "match_operator",
+            "is_active",
+        )
+        default_columns = ("name", "classify_as", "weight", "source_pattern", "match_against", "is_active")
+
+
+class DiscoveredDeviceClassificationTable(BaseTable):
+    discovered_device = tables.LinkColumn(verbose_name="Discovered Device")
+    matched_rule = tables.LinkColumn(verbose_name="Rule")
+
+    class Meta:
+        model = models.DiscoveredDeviceClassification
+        fields = ("discovered_device", "classify_as", "matched_rule", "reason")
+        default_columns = ("discovered_device", "classify_as", "matched_rule", "reason")

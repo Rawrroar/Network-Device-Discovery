@@ -41,8 +41,9 @@ Then re-run `nautobot-server migrate nautobot_plugin_device_auto_discovery`.
 - Single package: `nautobot_plugin_device_auto_discovery/`
 - Jobs auto-register via `ready()` import → `register_jobs()`
 - OID → platform mapping in `mappings.py` (static table, prefix matching)
-- Models: `DiscoveryScan`, `DiscoveryResult`, `DiscoveryProfile`, `DiscoveredDevice` (all `PrimaryModel`), plus `DiscoveryProfileSecretsGroupAssignment` (plain Nautobot `BaseModel` — no created/last_updated/_custom_field_data; matches core `SecretsGroupAssociation`)
+- Models: `DiscoveryScan`, `DiscoveryResult`, `DiscoveryProfile`, `DiscoveredDevice` (all `PrimaryModel`), plus `DiscoveryProfileSecretsGroupAssignment` and `DiscoveredDeviceClassification` (plain Nautobot `BaseModel` — no created/last_updated/_custom_field_data; matches core `SecretsGroupAssociation`) and `DeviceClassificationRule` (PrimaryModel). `contenttypes` must be a migration dependency for models with GenericForeignKey-style ContentType FKs.
 - Credentials come from Secrets Groups assigned to profiles (`secrets.py`: weighted SSH retry with last-known-working group on `DiscoveredDevice.ssh_secrets_group`; SNMP uses lowest-weight group only). Never put credentials in `DEFAULT_PLUGINS_CONFIG`.
+- Classification engine in `classification.py` (rules → Location/Role/Tenant for `new` devices); auto-recompute via `signals.py` registered in `ready()`. Model imports for targets must be `nautobot.dcim.models.Location` style, not `dcim.models.Location`.
 - REST API in `api/` (`NautobotModelViewSet` + `OrderedDefaultRouter`) mounted at `/api/plugins/device-auto-discovery/`; filtersets are `NautobotFilterSet` + `SearchFilter`
 - UI viewsets/tables implemented in `views.py`/`tables.py`
 - No external services required; uses `pysnmp` + `paramiko` at runtime

@@ -250,6 +250,96 @@ SSH_PROFILES = {
             ],
         },
     },
+    "Aruba": {
+        "vendor_keywords": ("aruba",),
+        "requires_enable": False,
+        "pre_commands": ["no page"],
+        "commands": ["show version", "show system"],
+        "data_commands": ["show ip interface brief", "show vrf"],
+        "route_commands": ["show ip route", "show ip route vrf {vrf}"],
+        "parsers": {
+            "hostname": [
+                r"^([A-Za-z0-9_.-]+)[>#]\s*$",
+                r"Host\s*[Nn]ame\s*[:\s]+(\S+)",
+                r"(?:hostname|host)\s*[:\s]+(\S+)",
+            ],
+            "model": [
+                r"(?:Aruba|HPE)\s+([A-Za-z0-9\-]+)\s+Switch",
+                r"Product\s*Model\s*[:\s]+(\S+)",
+                r"Model\s*[:\s]+(\S+)",
+                r"([A-Z]{2,4}\s?\d{4}[A-Z0-9\-]*)",
+            ],
+            "serial": [
+                r"Serial\s*[Nn]umber\s*[:\s]+(\S+)",
+                r"Serial\s*ID\s*[:\s]+(\S+)",
+                r"SN\s*[:\s]+(\S+)",
+            ],
+            "os_version": [
+                r"AOS-CX\s+(?:Software\s+)?[Vv]ersion\s+([0-9A-Za-z.()\-]+)",
+                r"arubaos-cx\s+[Vv]\S*\s+([0-9A-Za-z.()\-]+)",
+                r"ArubaOS\s+[Vv]ersion\s+([0-9A-Za-z.()\-]+)",
+                r"Version\s+([0-9A-Za-z.()\-]+)",
+            ],
+        },
+    },
+    "Cisco WLC": {
+        "vendor_keywords": ("aireos|cisco wlc|cisco controller|cisco air",),
+        "requires_enable": False,
+        "pre_commands": ["config paging disable"],
+        "commands": ["show sysinfo", "show inventory"],
+        "data_commands": ["show interface summary", "show interface detailed management"],
+        "route_commands": ["show network route"],
+        "parsers": {
+            "hostname": [
+                r"System\s*Name[\s.]+\s*(\S+)\s*$",
+                r"(?:hostname|host)\s*[:\s]+(\S+)",
+            ],
+            "model": [
+                r"Product\s*Model[\s.]+\s*(\S+)\s*$",
+                r"Model[\s.]+\s*(\S+)\s*$",
+            ],
+            "serial": [
+                r"Product\s*Serial\s*[Nn]umber[\s.]+\s*(\S+)\s*$",
+                r"Serial\s*[Nn]umber[\s.]+\s*(\S+)\s*$",
+            ],
+            "os_version": [
+                r"Product\s*Version[\s.]+\s*(\d+\.\d+[0-9A-Za-z.]*)\s*$",
+                r"Software\s*Version[\s.]+\s*(\d+\.\d+[0-9A-Za-z.]*)\s*$",
+                r"Version[\s.]+\s*(\d+\.\d+[0-9A-Za-z.]*)\s*$",
+            ],
+        },
+    },
+    "Brocade": {
+        "vendor_keywords": ("brocade|fastiron|foundry|ruckus.*icx|icx",),
+        "requires_enable": True,
+        "pre_commands": ["skip-page-display", "terminal length 0"],
+        "commands": ["show version", "show chassis"],
+        "data_commands": ["show ip interface brief", "show vlan brief", "show run vrf"],
+        "route_commands": ["show ip route", "show ip route vrf {vrf}"],
+        "parsers": {
+            "hostname": [
+                r"(?:hostname|host)\s+(\S+)",
+                r"^(?:telnet|SSH@)?@?([A-Za-z0-9_.-]+)[>#]\s*$",
+            ],
+            "model": [
+                r"Brocade\s+([A-Za-z0-9\-]+)",
+                r"Ruckus\s+([A-Za-z0-9\-]+)",
+                r"(?:ICX|FastIron)\s*([A-Za-z0-9\-]+)",
+                r"System.{0,40}?\b(ICX[A-Za-z0-9\-]+)",
+                r"Chassis\s*[:\s]+(\S+)",
+            ],
+            "serial": [
+                r"Serial\s*[Nn]umber\s*[:\s]+(\S+)",
+                r"Serial\s*ID\s*[:\s]+(\S+)",
+                r"SN\s*[:\s]+(\S+)",
+            ],
+            "os_version": [
+                r"FastIron\s+Version\s+([0-9A-Za-z.]+)",
+                r"Version\s+([0-9][0-9A-Za-z.]*)",
+                r"SW:\s*Version\s+([0-9A-Za-z.]+)",
+            ],
+        },
+    },
 }
 
 # Commands attempted for devices whose vendor could not be determined.

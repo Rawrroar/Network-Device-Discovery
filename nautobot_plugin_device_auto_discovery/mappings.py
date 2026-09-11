@@ -13,6 +13,10 @@ SNMP_OID_MAPPING = [
     ("1.3.6.1.4.1.9.1.649", "Cisco NX-OS", "Cisco", "nxos"),
     ("1.3.6.1.4.1.9.1.129", "Cisco IOS", "Cisco", "ios"),
     ("1.3.6.1.4.1.9.1.746", "Cisco SD-WAN vEdge", "Cisco", "ios"),
+    # Cisco WLC (AireOS) — wireless LAN controllers
+    ("1.3.6.1.4.1.9.1.828", "Cisco WLC AireOS", "Cisco", "cisco_wlc"),
+    ("1.3.6.1.4.1.9.1.1069", "Cisco WLC AireOS", "Cisco", "cisco_wlc"),
+    ("1.3.6.1.4.1.9.1.1226", "Cisco WLC 9800 IOS-XE", "Cisco", "cisco_wlc"),
     # Juniper
     ("1.3.6.1.4.1.2636.1.1.1", "Juniper Junos", "Juniper Networks", "junos"),
     # Arista
@@ -20,6 +24,13 @@ SNMP_OID_MAPPING = [
     # HP / HPE
     ("1.3.6.1.4.1.11.2.3.7.11", "HPE Comware", "HPE", "hp_comware"),
     ("1.3.6.1.4.1.11.2.9.1.1", "HPE ProCurve", "HPE", "hp_procurve"),
+    # Aruba (HPE enterprise networking: AOS-CX switches + ArubaOS controllers)
+    ("1.3.6.1.4.1.47196.1.1.1", "Aruba AOS-CX", "HPE", "aruba_os-cx"),
+    ("1.3.6.1.4.1.14823.1.1", "ArubaOS", "HPE", "aruba_os"),
+    ("1.3.6.1.4.1.14823.1.2", "Aruba Instant", "HPE", "aruba_instant"),
+    # Brocade / Ruckus FastIron
+    ("1.3.6.1.4.1.1991.1.3", "Brocade FastIron", "Ruckus", "ruckus_fastiron"),
+    ("1.3.6.1.4.1.1991.1", "Brocade FastIron", "Ruckus", "ruckus_fastiron"),
     # Nokia / Alcatel-Lucent
     ("1.3.6.1.4.1.2011.5.2", "Nokia SR OS", "Nokia", "nokia_sros"),
     ("1.3.6.1.4.1.2011.6.1", "Nokia SR Linux", "Nokia", "nokia_srl"),

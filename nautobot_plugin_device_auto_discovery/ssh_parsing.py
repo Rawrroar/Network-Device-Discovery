@@ -81,6 +81,15 @@ def parse_ssh_vrfs(command_outputs, vendor):
             if len(parts) >= 1 and parts[0].lower() not in ("instance", "vrf", "name"):
                 add(parts[0])
 
+    # Brocade FastIron "show run vrf": config-block output where each VRF is
+    # a top-level "vrf <name>" line followed by indented sub-commands.
+    fastiron_vrf_config = _data_output(command_outputs, "show run vrf")
+    if fastiron_vrf_config:
+        for line in fastiron_vrf_config.splitlines():
+            match = re.match(r"^vrf\s+(\S+)\s*$", line)
+            if match:
+                add(match.group(1))
+
     return vrfs
 
 
@@ -166,6 +175,26 @@ def parse_ssh_ip_addresses(command_outputs, vendor):
             match = re.match(r"^\s*(\S+)\s+\S+\s+([0-9a-fA-F:.]+)/(\d+)", line)
             if match:
                 add(match.group(2), match.group(3), match.group(1))
+    elif "aruba" in vendor or "brocade" in vendor or "fastiron" in vendor or "icx" in vendor:
+        # Aruba AOS-CX and Brocade FastIron both use a Cisco-like
+        # "show ip interface brief". AOS-CX puts <addr>/<mask-len> in the
+        # IP column; FastIron prints a plain dotted address. Interface
+        # names may contain spaces (e.g. FastIron "ve 1").
+        text = _data_output(command_outputs, "show ip interface brief")
+        for line in text.splitlines():
+            match = re.match(
+                r"^\s*(\S+)\s+([0-9a-fA-F:.]+)/(\d+)\s+\S+\s+\S+\s*(\S*)\s*$",
+                line,
+            )
+            if match:
+                add(match.group(2), match.group(3), match.group(1), match.group(4) or None)
+                continue
+            match = re.match(
+                r"^\s*(.+?)\s+(\d{1,3}(?:\.\d{1,3}){3})\s+\S+\s+\S+\s+(\S+)\s+(\S+)\s*$",
+                line,
+            )
+            if match and match.group(2) != "unassigned":
+                add(match.group(2), 32, match.group(1))
     else:
         # Generic / Linux "ip addr" or Cisco-style interface brief.
         text = _data_output(command_outputs, "ip addr") or _data_output(

@@ -78,10 +78,15 @@ OPER_STATUS_UP = 1
 
 
 VENDOR_KEYWORDS = {
+    # Cisco WLC must be checked before the generic Cisco keywords, otherwise
+    # AireOS/Controller banners resolve to plain "Cisco".
+    "aireos|cisco wlc|cisco controller|cisco air": "Cisco WLC",
     "cisco": "Cisco",
     "juniper": "Juniper Networks",
     "arista": "Arista Networks",
     "hp|hpe|procurve": "HPE",
+    "aruba": "Aruba",
+    "brocade|fastiron|foundry|ruckus.*icx|icx": "Brocade",
     "nokia|alcatel": "Nokia",
     "ubiquiti|edge|unifi|ucos|dream machine": "Ubiquiti",
     "f5|bigip": "F5 Networks",
@@ -94,9 +99,12 @@ VENDOR_KEYWORDS = {
 VENDOR_MODEL_PATTERNS = {
     "Ubiquiti": [r"\bUniFi\s+([A-Za-z0-9][A-Za-z0-9\-]*)", r"\b(?:USW|UCG|UDM|UAP|USG)[A-Za-z0-9\-]*"],
     "Cisco": [r"\b(C[A-Z0-9]{2,6}(?:-[A-Z0-9]+)+)\b"],
+    "Cisco WLC": [r"\b(AIR-[A-Z0-9\-]+|C9800[A-Za-z0-9\-]*)\b"],
     "Arista Networks": [r"\b(DCS(?:-[A-Za-z0-9]+)+)\b"],
     "Juniper Networks": [r"\b(ex\d+|mx\d+|qfx\d+|srx\d+)\b"],
     "HPE": [r"\b(?:HP\s+)?(?:Aruba|ProCurve|Comware|FlexFabric)\s+([A-Za-z0-9\-]+)"],
+    "Aruba": [r"\bAruba\s+([A-Za-z0-9\-]+)", r"\b((?:3610|3810|5400|6200|6300|6400|7200|8320|8325|8360|9300|CX)\s?[0-9A-Za-z\-]*)"],
+    "Brocade": [r"\b(?:ICX|FastIron)\s*([A-Za-z0-9\-]+)", r"\b(ICX[0-9]{4}[A-Za-z0-9\-]*)\b"],
 }
 
 # sysLocation/sysContact values that mean "not configured" and should be ignored.

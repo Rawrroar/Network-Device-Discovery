@@ -450,17 +450,21 @@ The plugin maps SNMP OIDs to Nautobot platforms for these vendors:
 
 | Vendor | Platforms |
 |--------|-----------|
-| Cisco | IOS, IOS-XE, IOS-XR, NX-OS |
+| Cisco | IOS, IOS-XE, IOS-XR, NX-OS, SD-WAN vEdge, WLC AireOS, WLC 9800 (IOS-XE) |
 | Juniper | Junos |
 | Arista | EOS |
 | HPE | Comware, ProCurve |
+| Aruba (HPE) | AOS-CX, ArubaOS, Instant |
+| Brocade / Ruckus | FastIron (ICX) |
 | Nokia | SR OS, SR Linux |
 | F5 | TMOS |
 | Palo Alto | PAN-OS |
 | Fortinet | FortiOS |
-| Ubiquiti | EdgeOS, EdgeMAX |
+| Ubiquiti | EdgeOS, airOS, EdgeMAX, UniFi |
 
-For SSH-discovered devices, vendor detection is done via keyword matching on command output.
+For SSH-discovered devices, vendor detection is done via keyword matching on command output. SSH identification commands, parsers, and VRF/IP/route collectors are available for all of the above (Aruba AOS-CX and Brocade FastIron use Cisco-like `show ip interface brief` / `show ip route` collectors).
+
+The SNMP and SSH platform coverage matrix (which attribute is collected per platform, with stability markers) follows the same platforms as the Nautobot Device Discovery app; treat mappings for the 🧪-class platforms (Nokia, ArubaOS, WLC, FastIron) as best-effort community coverage.
 
 ## Configuration Reference
 

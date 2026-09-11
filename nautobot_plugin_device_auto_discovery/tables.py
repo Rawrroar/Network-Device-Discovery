@@ -74,7 +74,7 @@ class DiscoveryProfileTable(BaseTable):
 
     class Meta:
         model = models.DiscoveryProfile
-        fields = ("name", "status", "protocols", "included_ip_prefixes", "maximum_ip_addresses", "created")
+        fields = ("name", "status", "protocols", "included_ip_prefixes", "maximum_ip_addresses", "secrets_groups", "created")
         default_columns = ("name", "status", "protocols", "included_ip_prefixes", "created")
 
 
@@ -97,6 +97,18 @@ class DiscoveredDeviceTable(BaseTable):
             "device",
             "snmp_collection",
             "ssh_collection",
+            "ssh_secrets_group",
+            "snmp_secrets_group",
             "last_seen",
         )
         default_columns = ("hostname", "ip_address", "status", "vendor", "device", "last_seen")
+
+
+class DiscoveryProfileSecretsGroupAssignmentTable(BaseTable):
+    discovery_profile = tables.LinkColumn()
+    secrets_group = tables.LinkColumn()
+
+    class Meta:
+        model = models.DiscoveryProfileSecretsGroupAssignment
+        fields = ("discovery_profile", "secrets_group", "weight", "created")
+        default_columns = ("discovery_profile", "secrets_group", "weight")

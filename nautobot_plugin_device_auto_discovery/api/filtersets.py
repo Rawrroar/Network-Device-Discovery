@@ -47,7 +47,7 @@ class DiscoveryProfileFilterSet(NautobotFilterSet):
 
     class Meta:
         model = models.DiscoveryProfile
-        fields = ("name", "status")
+        fields = ("name", "status", "secrets_groups")
 
 
 class DiscoveredDeviceFilterSet(NautobotFilterSet):
@@ -64,4 +64,23 @@ class DiscoveredDeviceFilterSet(NautobotFilterSet):
 
     class Meta:
         model = models.DiscoveredDevice
-        fields = ("ip_address", "hostname", "status", "device", "snmp_collection", "ssh_collection")
+        fields = (
+            "ip_address",
+            "hostname",
+            "status",
+            "device",
+            "snmp_collection",
+            "ssh_collection",
+            "ssh_secrets_group",
+            "snmp_secrets_group",
+        )
+
+
+class DiscoveryProfileSecretsGroupAssignmentFilterSet(NautobotFilterSet):
+    """FilterSet for DiscoveryProfileSecretsGroupAssignment objects."""
+
+    q = SearchFilter(filter_predicates={"discovery_profile__name": "icontains", "secrets_group__name": "icontains"})
+
+    class Meta:
+        model = models.DiscoveryProfileSecretsGroupAssignment
+        fields = ("discovery_profile", "secrets_group", "weight")

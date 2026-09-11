@@ -35,3 +35,11 @@ class DiscoveredDeviceSerializer(NautobotModelSerializer):
     class Meta:
         model = models.DiscoveredDevice
         fields = "__all__"
+
+
+class DiscoveryProfileSecretsGroupAssignmentSerializer(NautobotModelSerializer):
+    """Serializer for DiscoveryProfileSecretsGroupAssignment objects."""
+
+    class Meta:
+        model = models.DiscoveryProfileSecretsGroupAssignment
+        fields = "__all__"

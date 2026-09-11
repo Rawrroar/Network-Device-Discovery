@@ -36,3 +36,11 @@ class DiscoveredDeviceViewSet(NautobotModelViewSet):
     queryset = models.DiscoveredDevice.objects.all()
     serializer_class = serializers.DiscoveredDeviceSerializer
     filterset_class = filtersets.DiscoveredDeviceFilterSet
+
+
+class DiscoveryProfileSecretsGroupAssignmentViewSet(NautobotModelViewSet):
+    """ViewSet for DiscoveryProfileSecretsGroupAssignment objects."""
+
+    queryset = models.DiscoveryProfileSecretsGroupAssignment.objects.all()
+    serializer_class = serializers.DiscoveryProfileSecretsGroupAssignmentSerializer
+    filterset_class = filtersets.DiscoveryProfileSecretsGroupAssignmentFilterSet

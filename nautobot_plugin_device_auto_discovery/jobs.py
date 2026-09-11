@@ -50,6 +50,14 @@ from nautobot.tenancy.models import Tenant
 from .models import DiscoveryProfile, DiscoveryResult, DiscoveryScan, DiscoveredDevice
 from .correlation import correlate_device
 from .mappings import lookup_platform_from_oid
+from .secrets import (
+    ordered_secrets_groups,
+    record_ssh_success,
+    snmp_secrets_config,
+    ssh_credential_candidates,
+    ssh_credential_from_config,
+    ssh_connect_with_credentials,
+)
 from .snmp_tables import discover_snmp_tables, find_chassis_model, find_chassis_serial, snmp_get
 from .ssh_parsing import parse_ssh_vrfs, parse_ssh_ip_addresses, parse_ssh_routes
 from .ssh_profiles import SSH_PROFILES, GENERIC_INFO_COMMANDS, GENERIC_DATA_COMMANDS, GENERIC_ROUTE_COMMANDS
@@ -651,6 +659,28 @@ def apply_profile(config, profile):
         config["snmpv3_priv_protocol"] = profile.snmpv3_priv_protocol
     if profile.strip_domain_suffixes:
         config["strip_domain_suffixes"] = list(profile.strip_domain_suffixes)
+
+    # Secrets-group credentials: when the profile has secrets groups with
+    # SNMP secrets, they take precedence over plugin defaults (profile is
+    # the source of truth for credentials). Explicit job-variable input is
+    # preserved as protocol/context defaults for v3.
+    if profile.secrets_group_assignments.exists():
+        snmp_overrides = snmp_secrets_config(profile, config)
+        if snmp_overrides is not None:
+            _strip_default_snmp_credentials(config)
+            config.update(snmp_overrides)
+
+
+def _strip_default_snmp_credentials(config):
+    """Remove plugin-default SNMP credential keys before secrets merging."""
+    for key in (
+        "snmp_community",
+        "snmpv3_username",
+        "snmpv3_auth_key",
+        "snmpv3_priv_key",
+        "snmpv3_context_name",
+    ):
+        config.pop(key, None)
 
 
 def _resolve_networks(target_network, profile=None):
@@ -1514,9 +1544,6 @@ class SNMPDiscoveryJob(Job):
         if snmp_version not in ("1", "2", "2c", "3"):
             self.logger.error("Invalid snmp_version %r; expected '1', '2c', or '3'.", snmp_version)
             return {"error": f"Invalid snmp_version {snmp_version!r}"}
-        if snmp_version == "3" and not (snmpv3_username or "").strip():
-            self.logger.error("snmp_version '3' requires an SNMPv3 username.")
-            return {"error": "snmp_version '3' requires an SNMPv3 username"}
         config["snmp_version"] = snmp_version
         config["snmp_community"] = snmp_community or config.get("snmp_community", "public")
         config["snmpv3_username"] = snmpv3_username or ""
@@ -1536,6 +1563,10 @@ class SNMPDiscoveryJob(Job):
         config["create_cables"] = create_cables
 
         apply_profile(config, profile)
+
+        if config.get("snmp_version") == "3" and not (config.get("snmpv3_username") or "").strip():
+            self.logger.error("snmp_version '3' requires an SNMPv3 username (job input or profile secrets group).")
+            return {"error": "snmp_version '3' requires an SNMPv3 username"}
 
         networks, excluded = _resolve_networks(target_network, profile)
         if not networks:
@@ -1918,6 +1949,53 @@ def ssh_connect_and_discover(
             pass
 
 
+def ssh_discover_device(ip_str, config):
+    """Discover device info via SSH honoring secrets-group credentials.
+
+    Resolves credential candidates from the profile's secrets groups
+    (attempting the stored last-known-working group first), falling back to
+    job/plugin config credentials when no profile or no usable secrets exist.
+
+    On success, records the working secrets group on the device's
+    DiscoveredDevice record (when present) for future Fast-Path-style reuse.
+
+    Returns:
+        dict as returned by ``ssh_connect_and_discover``, or None on failure.
+    """
+    profile = config.get("profile")
+    candidates = ssh_credential_candidates(profile, config) if profile is not None else []
+    if not candidates:
+        single = ssh_credential_from_config(config)
+        candidates = [single] if single else []
+
+    preferred = None
+    discovered_device = DiscoveredDevice.objects.filter(ip_address=ip_str).first()
+    if discovered_device is not None and discovered_device.ssh_secrets_group_id:
+        preferred = discovered_device.ssh_secrets_group
+        if preferred in [c.get("secrets_group") for c in candidates]:
+            candidates = [c for c in candidates if c.get("secrets_group") is preferred] + [
+                c for c in candidates if c.get("secrets_group") is not preferred
+            ]
+
+    info, candidate = ssh_connect_with_credentials(
+        ip_str,
+        candidates,
+        ssh_connect_and_discover,
+        timeout=config.get("ssh_timeout", 10),
+        banner_timeout=config.get("ssh_banner_timeout", 30),
+        port=config.get("ssh_port", 22),
+        enable_password=config.get("ssh_enable_password"),
+        port_check=config.get("ssh_port_check", True),
+    )
+
+    if info and candidate:
+        if discovered_device is None:
+            discovered_device = DiscoveredDevice.objects.filter(ip_address=ip_str).first()
+        record_ssh_success(discovered_device, candidate)
+
+    return info
+
+
 class SSHDiscoveryJob(Job):
     """Discover devices via SSH across an IP range.
 
@@ -1961,6 +2039,11 @@ class SSHDiscoveryJob(Job):
         max_value=65535,
         description="SSH port to connect to.",
     )
+    profile = ObjectVar(
+        model=DiscoveryProfile,
+        required=False,
+        description="Optional DiscoveryProfile supplying scan scope and Secrets Group credentials.",
+    )
     timeout = IntegerVar(
         default=10,
         min_value=3,
@@ -1975,12 +2058,16 @@ class SSHDiscoveryJob(Job):
     )
     dryrun = DryRunVar()
 
-    def run(self, *, target_network, ssh_username, ssh_password, ssh_port=22, timeout, concurrency, dryrun=False):
+    def run(self, *, target_network, ssh_username, ssh_password, ssh_port=22, timeout, concurrency, dryrun=False, profile=None):
         config = get_plugin_config()
-        ssh_username = ssh_username or config.get("ssh_username", "admin")
+        ssh_username = ssh_username or config.get("ssh_username", "")
         ssh_password = ssh_password or config.get("ssh_password", "")
         ssh_port = ssh_port or config.get("ssh_port", 22)
         timeout = timeout or config.get("ssh_timeout", 10)
+        config["ssh_port"] = ssh_port
+
+        if profile:
+            apply_profile(config, profile)
 
         network = IPNetwork(target_network)
         scan_name = f"SSH Scan: {network}"
@@ -1995,12 +2082,16 @@ class SSHDiscoveryJob(Job):
         total = len(list(network))
         self.logger.info("Starting SSH discovery of %s (%d hosts)", network, total)
 
-        if not ssh_password:
-            self.logger.error("SSH password is required but was not provided.")
+        candidates = ssh_credential_candidates(profile, config) if profile is not None else []
+        if not candidates:
+            single = ssh_credential_from_config(config)
+            candidates = [single] if single else []
+        if not candidates:
+            self.logger.error("SSH credentials are required: assign a Secrets Group to the profile or provide job credentials.")
             discovery_scan.status = "failed"
-            discovery_scan.error_message = "SSH password not provided"
+            discovery_scan.error_message = "SSH credentials not provided (no secrets group, job input, or plugin default)"
             discovery_scan.save()
-            return {"error": "SSH password not provided"}
+            return {"error": "SSH credentials not provided (no secrets group, job input, or plugin default)"}
 
         discovered = 0
         created = 0
@@ -2012,10 +2103,10 @@ class SSHDiscoveryJob(Job):
             nonlocal discovered, created, failed, existing
             ip_str = str(ip)
             try:
-                info = ssh_connect_and_discover(
+                info, candidate = ssh_connect_with_credentials(
                     ip_str,
-                    ssh_username,
-                    ssh_password,
+                    candidates,
+                    ssh_connect_and_discover,
                     timeout=timeout,
                     banner_timeout=config.get("ssh_banner_timeout", 30),
                     port=ssh_port,
@@ -2024,6 +2115,7 @@ class SSHDiscoveryJob(Job):
                 )
                 if not info:
                     return
+                record_ssh_success(DiscoveredDevice.objects.filter(ip_address=ip_str).first(), candidate)
 
                 with lock:
                     discovered += 1
@@ -2275,9 +2367,6 @@ class FullDiscoveryJob(Job):
         if snmp_version not in ("1", "2", "2c", "3"):
             self.logger.error("Invalid snmp_version %r; expected '1', '2c', or '3'.", snmp_version)
             return {"error": f"Invalid snmp_version {snmp_version!r}"}
-        if snmp_version == "3" and not (snmpv3_username or "").strip():
-            self.logger.error("snmp_version '3' requires an SNMPv3 username.")
-            return {"error": "snmp_version '3' requires an SNMPv3 username"}
         config["snmp_version"] = snmp_version
         config["snmp_community"] = snmp_community or config.get("snmp_community", "public")
         config["snmpv3_username"] = snmpv3_username or ""
@@ -2286,10 +2375,19 @@ class FullDiscoveryJob(Job):
         config["snmpv3_priv_protocol"] = snmpv3_priv_protocol or "AES"
         config["snmpv3_priv_key"] = snmpv3_priv_key or ""
         config["snmpv3_context_name"] = snmpv3_context_name or ""
-        ssh_username = ssh_username or config.get("ssh_username", "admin")
+        ssh_username = ssh_username or config.get("ssh_username", "")
         ssh_password = ssh_password or config.get("ssh_password", "")
         apply_profile(config, profile)
         ssh_port = config.get("ssh_port", 22)
+
+        if config.get("snmp_version") == "3" and not (config.get("snmpv3_username") or "").strip():
+            self.logger.error("snmp_version '3' requires an SNMPv3 username (job input or profile secrets group).")
+            return {"error": "snmp_version '3' requires an SNMPv3 username"}
+
+        ssh_candidates = ssh_credential_candidates(profile, config) if profile is not None else []
+        if not ssh_candidates:
+            single = ssh_credential_from_config(config)
+            ssh_candidates = [single] if single else []
 
         networks, excluded = _resolve_networks(target_network, profile)
         if not networks:
@@ -2395,7 +2493,7 @@ class FullDiscoveryJob(Job):
 
         # Phase 3: SSH Discovery (on hosts not found by SNMP)
         ssh_targets = live_hosts - discovered_hosts
-        if enable_ssh and ssh_targets and ssh_password:
+        if enable_ssh and ssh_targets and ssh_candidates:
             self.logger.info("Phase 3: SSH discovery on %d remaining hosts", len(ssh_targets))
 
             lock = threading.Lock()
@@ -2403,8 +2501,10 @@ class FullDiscoveryJob(Job):
             def ssh_scan(ip_str):
                 nonlocal total_discovered, total_created, total_existing, total_conflicts, total_failed
                 try:
-                    info = ssh_connect_and_discover(
-                        ip_str, ssh_username, ssh_password,
+                    info, candidate = ssh_connect_with_credentials(
+                        ip_str,
+                        ssh_candidates,
+                        ssh_connect_and_discover,
                         timeout=timeout,
                         banner_timeout=config.get("ssh_banner_timeout", 30),
                         port=ssh_port,
@@ -2413,6 +2513,7 @@ class FullDiscoveryJob(Job):
                     )
                     if not info:
                         return
+                    record_ssh_success(DiscoveredDevice.objects.filter(ip_address=ip_str).first(), candidate)
 
                     with lock:
                         total_discovered += 1
@@ -2659,9 +2760,6 @@ class CrawlDiscoveryJob(Job):
         if snmp_version not in ("1", "2", "2c", "3"):
             self.logger.error("Invalid snmp_version %r; expected '1', '2c', or '3'.", snmp_version)
             return {"error": f"Invalid snmp_version {snmp_version!r}"}
-        if snmp_version == "3" and not (snmpv3_username or "").strip():
-            self.logger.error("snmp_version '3' requires an SNMPv3 username.")
-            return {"error": "snmp_version '3' requires an SNMPv3 username"}
         config["snmp_version"] = snmp_version
         config["snmp_community"] = snmp_community or config.get("snmp_community", "public")
         config["snmpv3_username"] = snmpv3_username or ""
@@ -2670,6 +2768,15 @@ class CrawlDiscoveryJob(Job):
         config["snmpv3_priv_protocol"] = snmpv3_priv_protocol or "AES"
         config["snmpv3_priv_key"] = snmpv3_priv_key or ""
         config["snmpv3_context_name"] = snmpv3_context_name or ""
+
+        # Re-apply profile so secrets-group SNMP credentials win over the
+        # job-level values merged above (only when the profile has groups).
+        if profile and profile.secrets_group_assignments.exists():
+            apply_profile(config, profile)
+
+        if config.get("snmp_version") == "3" and not (config.get("snmpv3_username") or "").strip():
+            self.logger.error("snmp_version '3' requires an SNMPv3 username (job input or profile secrets group).")
+            return {"error": "snmp_version '3' requires an SNMPv3 username"}
 
         start_ip = (seed_ip or "").strip()
         if not start_ip:
@@ -2939,16 +3046,30 @@ class VRFRouteDiscoveryJob(Job):
         config["snmpv3_priv_protocol"] = kwargs.get("snmpv3_priv_protocol", "AES")
         config["snmpv3_priv_key"] = kwargs.get("snmpv3_priv_key", "")
         config["snmpv3_context_name"] = kwargs.get("snmpv3_context_name", "")
+        profile = kwargs.get("profile")
+        if profile:
+            apply_profile(config, profile)
+        else:
+            apply_profile(config, None)
         ssh_enabled = kwargs.get("ssh_enabled", True)
         ssh_username = kwargs.get("ssh_username", "") or config.get("ssh_username", "")
         ssh_password = kwargs.get("ssh_password", "") or config.get("ssh_password", "")
-        ssh_port = kwargs.get("ssh_port", 22)
+        ssh_port = kwargs.get("ssh_port", 22) or config.get("ssh_port", 22)
         timeout = kwargs.get("timeout", 10)
         concurrency = kwargs.get("concurrency", 10)
         populate_vrfs = kwargs.get("populate_vrfs", True)
         populate_prefixes = kwargs.get("populate_prefixes", True)
         tenant_obj = kwargs.get("tenant")
         dryrun = kwargs.get("dryrun", False)
+
+        # Prefer profile secrets-group SSH credentials when available.
+        ssh_candidates = ssh_credential_candidates(profile, config) if profile is not None else []
+        if not ssh_candidates:
+            single = ssh_credential_from_config(config)
+            ssh_candidates = [single] if single else []
+        if ssh_candidates:
+            ssh_username = ssh_candidates[0]["username"]
+            ssh_password = ssh_candidates[0]["password"]
 
         config["snmp_timeout"] = min(timeout, 10)
         enable_password = config.get("ssh_enable_password", "")

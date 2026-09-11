@@ -3,7 +3,7 @@
 import django.core.serializers.json
 
 from django.db import models
-from nautobot.apps.models import PrimaryModel
+from nautobot.apps.models import BaseModel, PrimaryModel
 
 
 class DiscoveryScan(PrimaryModel):
@@ -286,12 +286,51 @@ class DiscoveryProfile(PrimaryModel):
         ],
         help_text="Whether this profile is available for use.",
     )
+    secrets_groups = models.ManyToManyField(
+        to="extras.SecretsGroup",
+        through="DiscoveryProfileSecretsGroupAssignment",
+        related_name="discovery_profiles",
+        blank=True,
+        help_text="Secrets Groups supplying SNMP and SSH credentials, ordered by weight.",
+    )
 
     class Meta:
         ordering = ["name"]
 
     def __str__(self):
         return self.name
+
+
+class DiscoveryProfileSecretsGroupAssignment(BaseModel):
+    """Assign a Secrets Group to a Discovery Profile with a priority weight.
+
+    Lower weights are tried first for SSH credential iteration; SNMP uses
+    only the lowest-weight group that defines SNMP secrets.
+    """
+
+    discovery_profile = models.ForeignKey(
+        to="nautobot_plugin_device_auto_discovery.DiscoveryProfile",
+        on_delete=models.CASCADE,
+        related_name="secrets_group_assignments",
+        help_text="The Discovery Profile this Secrets Group is assigned to.",
+    )
+    secrets_group = models.ForeignKey(
+        to="extras.SecretsGroup",
+        on_delete=models.CASCADE,
+        related_name="discovery_profile_assignments",
+        help_text="The Secrets Group providing credentials for discovery.",
+    )
+    weight = models.PositiveSmallIntegerField(
+        default=1000,
+        help_text="Priority of this group; lower weights are attempted first (SSH) or preferred (SNMP).",
+    )
+
+    class Meta:
+        unique_together = ("discovery_profile", "secrets_group")
+        ordering = ("discovery_profile", "weight", "secrets_group__name")
+
+    def __str__(self):
+        return f"{self.discovery_profile}: {self.secrets_group} (weight {self.weight})"
 
 
 class DiscoveredDevice(PrimaryModel):
@@ -435,6 +474,22 @@ class DiscoveredDevice(PrimaryModel):
         blank=True,
         default=dict,
         help_text="Raw collection data captured during the last discovery run.",
+    )
+    ssh_secrets_group = models.ForeignKey(
+        to="extras.SecretsGroup",
+        on_delete=models.SET_NULL,
+        related_name="discovered_devices_ssh",
+        blank=True,
+        null=True,
+        help_text="Secrets Group whose SSH credentials last succeeded on this device.",
+    )
+    snmp_secrets_group = models.ForeignKey(
+        to="extras.SecretsGroup",
+        on_delete=models.SET_NULL,
+        related_name="discovered_devices_snmp",
+        blank=True,
+        null=True,
+        help_text="Secrets Group whose SNMP credentials last succeeded on this device.",
     )
 
     class Meta:

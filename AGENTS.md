@@ -41,9 +41,10 @@ Then re-run `nautobot-server migrate nautobot_plugin_device_auto_discovery`.
 - Single package: `nautobot_plugin_device_auto_discovery/`
 - Jobs auto-register via `ready()` import → `register_jobs()`
 - OID → platform mapping in `mappings.py` (static table, prefix matching)
-- Models: `DiscoveryScan`, `DiscoveryResult`, `DiscoveryProfile`, `DiscoveredDevice` (all `PrimaryModel`)
+- Models: `DiscoveryScan`, `DiscoveryResult`, `DiscoveryProfile`, `DiscoveredDevice` (all `PrimaryModel`), plus `DiscoveryProfileSecretsGroupAssignment` (plain Nautobot `BaseModel` — no created/last_updated/_custom_field_data; matches core `SecretsGroupAssociation`)
+- Credentials come from Secrets Groups assigned to profiles (`secrets.py`: weighted SSH retry with last-known-working group on `DiscoveredDevice.ssh_secrets_group`; SNMP uses lowest-weight group only). Never put credentials in `DEFAULT_PLUGINS_CONFIG`.
 - REST API in `api/` (`NautobotModelViewSet` + `OrderedDefaultRouter`) mounted at `/api/plugins/device-auto-discovery/`; filtersets are `NautobotFilterSet` + `SearchFilter`
-- UI viewsets/tables (Phase B) not yet implemented — REST + job forms only
+- UI viewsets/tables implemented in `views.py`/`tables.py`
 - No external services required; uses `pysnmp` + `paramiko` at runtime
 
 ## Deploy

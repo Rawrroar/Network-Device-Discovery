@@ -10,5 +10,6 @@ router.register("discovery-scans", views.DiscoveryScanViewSet)
 router.register("discovery-results", views.DiscoveryResultViewSet)
 router.register("discovery-profiles", views.DiscoveryProfileViewSet)
 router.register("discovered-devices", views.DiscoveredDeviceViewSet)
+router.register("discovery-profile-secrets-groups", views.DiscoveryProfileSecretsGroupAssignmentViewSet)
 
 urlpatterns = router.urls

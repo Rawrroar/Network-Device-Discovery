@@ -44,3 +44,13 @@ class DiscoveredDeviceUIViewSet(NautobotUIViewSet):
     queryset = models.DiscoveredDevice.objects.all()
     serializer_class = serializers.DiscoveredDeviceSerializer
     table_class = tables.DiscoveredDeviceTable
+
+
+class DiscoveryProfileSecretsGroupAssignmentUIViewSet(NautobotUIViewSet):
+    bulk_update_form_class = forms.DiscoveryProfileSecretsGroupAssignmentBulkEditForm
+    filterset_class = filtersets.DiscoveryProfileSecretsGroupAssignmentFilterSet
+    filterset_form_class = forms.DiscoveryProfileFilterForm
+    form_class = forms.DiscoveryProfileSecretsGroupAssignmentForm
+    queryset = models.DiscoveryProfileSecretsGroupAssignment.objects.all()
+    serializer_class = serializers.DiscoveryProfileSecretsGroupAssignmentSerializer
+    table_class = tables.DiscoveryProfileSecretsGroupAssignmentTable

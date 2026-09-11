@@ -2,6 +2,7 @@
 
 from django import forms
 from nautobot.apps.forms import NautobotBulkEditForm, NautobotFilterForm, NautobotModelForm
+from nautobot.extras.models import SecretsGroup
 
 from nautobot_plugin_device_auto_discovery import models
 
@@ -35,6 +36,12 @@ class DiscoveredDeviceForm(NautobotModelForm):
         fields = "__all__"
 
 
+class DiscoveryProfileSecretsGroupAssignmentForm(NautobotModelForm):
+    class Meta:
+        model = models.DiscoveryProfileSecretsGroupAssignment
+        fields = "__all__"
+
+
 # ---------------------------------------------------------------------------
 # Filter forms (sidebar)
 # ---------------------------------------------------------------------------
@@ -47,6 +54,11 @@ class DiscoveryProfileFilterForm(NautobotFilterForm):
         choices=[("active", "Active"), ("inactive", "Inactive")],
         required=False,
         label="Status",
+    )
+    secrets_groups = forms.ModelMultipleChoiceField(
+        queryset=SecretsGroup.objects.all(),
+        required=False,
+        label="Secrets Groups",
     )
 
 
@@ -158,3 +170,14 @@ class DiscoveredDeviceBulkEditForm(NautobotBulkEditForm):
     class Meta:
         model = models.DiscoveredDevice
         fields = ["status"]
+
+
+class DiscoveryProfileSecretsGroupAssignmentBulkEditForm(NautobotBulkEditForm):
+    pk = forms.ModelMultipleChoiceField(
+        queryset=models.DiscoveryProfileSecretsGroupAssignment.objects.all(),
+        widget=forms.MultipleHiddenInput(),
+    )
+
+    class Meta:
+        model = models.DiscoveryProfileSecretsGroupAssignment
+        fields = ["weight"]

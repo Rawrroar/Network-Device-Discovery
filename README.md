@@ -22,6 +22,7 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - **Cable linking** — creates `dcim.Cable` objects from LLDP/CDP neighbor data when both ends can be resolved
 - **Crawl Discovery** — iteratively discovers devices from a seed device by following LLDP/CDP neighbors hop by hop
 - **DiscoveryProfiles** — reusable scan-scope and settings (prefixes, exclusions, IP cap, ports, timeouts, domain stripping) applied to the SNMP, Full, and Crawl jobs
+- **Secrets-based credentials** — SSH and SNMP credentials resolved from weighted Secrets Groups assigned to a profile; the last-known-working SSH group is remembered per device, and SNMPv3 security levels are derived from the secrets present (no credentials in `PLUGINS_CONFIG`)
 - **Inventory correlation** — each discovered IP is matched against Nautobot by primary IP, hostname, and serial, and persisted on a `DiscoveredDevice` record as `imported`, `new`, `partially_imported`, or `conflict`
 - Compatible with Nautobot v3.x
 
@@ -81,13 +82,8 @@ PLUGINS_CONFIG = {
         "snmp_timeout": 3,
         "snmp_retries": 2,
         "snmp_version": "2c",
-        "snmp_community": "public",
-        "snmpv3_username": "",
         "snmpv3_auth_protocol": "SHA",
-        "snmpv3_auth_key": "",
         "snmpv3_priv_protocol": "AES",
-        "snmpv3_priv_key": "",
-        "snmpv3_context_name": "",
         "populate_interfaces": True,
         "populate_ip_addresses": True,
         "populate_vlans": True,
@@ -97,14 +93,17 @@ PLUGINS_CONFIG = {
         "ssh_timeout": 10,
         "ssh_banner_timeout": 30,
         "ssh_port": 22,
-        "ssh_username": "admin",
-        "ssh_password": "",
         "ssh_port_check": True,
         "ping_timeout": 2,
         "concurrency": 10,
     },
 }
 ```
+
+> **Note:** Credential values (`snmp_community`, `snmpv3_*_key`, `ssh_username`,
+> `ssh_password`) are intentionally **not** plugin settings. Provide credentials
+> through a `SecretsGroup` assigned to a `DiscoveryProfile` (recommended), or as
+> job inputs at run time.
 
 ### 4. Run migrations
 
@@ -224,6 +223,35 @@ A visited set (keyed on IP) plus the depth and device caps keep the crawl finite
 - `fast_path` — reserved for the fast-path optimization
 - `strip_domain_suffixes` — domain suffixes stripped from discovered hostnames (case-insensitive, longest match wins, dot boundary required)
 
+### Secrets & Credential Management
+
+Credentials are sourced from Nautobot's native **Secrets** framework. Assign one
+or more Secrets Groups to a Discovery Profile (each with a priority **weight**)
+via the **Discovery Profile Secrets Groups** UI list or the
+`/api/plugins/device-auto-discovery/discovery-profile-secrets-groups/` endpoint.
+
+**SSH credential selection:**
+
+1. Groups are ordered by ascending weight (ties broken by name).
+2. The **last known working** group recorded on a `DiscoveredDevice` (from a
+   previous successful collection against that IP) is attempted first.
+3. Each group's SSH Username/Password secrets are tried in order until
+   authentication succeeds.
+
+**SNMP credential selection:**
+
+- Only the **lowest-weight** group that defines SNMP secrets is used, with no
+  fallback attempts.
+- A group supplies v2c credentials via an SNMP **Token** (community string) or
+  v3 credentials via SNMP **Username** + **Password** (auth key) + **Key**
+  (priv key). The security level (noAuthNoPriv / authNoPriv / authPriv) is
+  derived from which secrets are present.
+
+All secret values are fetched through the secrets **provider** at query time
+(Environment Variable, text file, Vault, ...), so nothing sensitive is stored
+in the plugin. When no profile secrets group applies, jobs fall back to
+explicit job inputs.
+
 ### Inventory Correlation
 
 Every discovered IP is recorded as a persistent `DiscoveredDevice` row and matched against the Nautobot inventory using three identifying attributes:
@@ -257,6 +285,7 @@ The plugin also exposes its own REST API under `/api/plugins/device-auto-discove
 | `/discovery-results/` | `DiscoveryResult` — one row per host per scan |
 | `/discovery-profiles/` | `DiscoveryProfile` — reusable scan-scope bundles |
 | `/discovered-devices/` | `DiscoveredDevice` — per-IP correlation ledger |
+| `/discovery-profile-secrets-groups/` | `DiscoveryProfileSecretsGroupAssignment` — weighted credentials per profile |
 
 Each endpoint supports the standard Nautobot queryset actions (list, retrieve, create,
 update, delete) and is searchable via the `q` parameter.
@@ -291,13 +320,8 @@ For SSH-discovered devices, vendor detection is done via keyword matching on com
 | `snmp_timeout` | `3` | SNMP query timeout in seconds |
 | `snmp_retries` | `2` | SNMP retry count |
 | `snmp_version` | `"2c"` | SNMP version: `"1"`, `"2c"`, or `"3"` (USM) |
-| `snmp_community` | `"public"` | Default SNMP community string (v1/v2c) |
-| `snmpv3_username` | `""` | SNMPv3 USM username |
 | `snmpv3_auth_protocol` | `"SHA"` | SNMPv3 auth protocol: `noAuth`, `MD5`, `SHA`, `SHA-256`, `SHA-384`, `SHA-512` |
-| `snmpv3_auth_key` | `""` | SNMPv3 auth passphrase |
 | `snmpv3_priv_protocol` | `"AES"` | SNMPv3 privacy protocol: `noPriv`, `DES`, `3DES`, `AES`, `AES-192`, `AES-256` |
-| `snmpv3_priv_key` | `""` | SNMPv3 privacy passphrase |
-| `snmpv3_context_name` | `""` | Optional SNMPv3 context name |
 | `populate_interfaces` | `True` | Create `dcim.Interface` objects from IF-MIB |
 | `populate_ip_addresses` | `True` | Create/assign `ipam.IPAddress` objects from IP-MIB |
 | `populate_vlans` | `True` | Create `ipam.VLAN` objects from Q-BRIDGE-MIB |
@@ -307,8 +331,6 @@ For SSH-discovered devices, vendor detection is done via keyword matching on com
 | `ssh_timeout` | `10` | SSH connection timeout in seconds |
 | `ssh_banner_timeout` | `30` | SSH banner wait timeout in seconds |
 | `ssh_port` | `22` | SSH port used for discovery |
-| `ssh_username` | `"admin"` | Default SSH username (used when the job input is left empty) |
-| `ssh_password` | `""` | Default SSH password (used when the job input is left empty) |
 | `ssh_port_check` | `True` | TCP-port-check the host before attempting the SSH handshake |
 | `ssh_enable_password` | `""` | Enable password used when a device requires privilege escalation |
 | `ping_timeout` | `2` | ICMP ping timeout in seconds |

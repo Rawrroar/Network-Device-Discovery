@@ -13,18 +13,11 @@ DEFAULT_PLUGINS_CONFIG = {
     "snmp_timeout": 3,
     "snmp_retries": 2,
     "snmp_version": "2c",
-    "snmp_community": "public",
-    "snmpv3_username": "",
     "snmpv3_auth_protocol": "SHA",
-    "snmpv3_auth_key": "",
     "snmpv3_priv_protocol": "AES",
-    "snmpv3_priv_key": "",
-    "snmpv3_context_name": "",
     "ssh_timeout": 10,
     "ssh_banner_timeout": 30,
     "ssh_port": 22,
-    "ssh_username": "admin",
-    "ssh_password": "",
     "ssh_port_check": True,
     "ssh_enable_password": "",
     "ping_timeout": 2,
@@ -43,7 +36,7 @@ DEFAULT_PLUGINS_CONFIG = {
 class DeviceAutoDiscoveryConfig(NautobotAppConfig):
     name = "nautobot_plugin_device_auto_discovery"
     verbose_name = "Device Auto-Discovery"
-    version = "0.3.4"
+    version = "0.4.0"
     author = "Developer"
     author_email = "dev@example.com"
     description = "Automatic network device discovery via ICMP ping, SNMP, and SSH."

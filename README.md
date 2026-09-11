@@ -26,6 +26,7 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - **Automated classification** — weighted rules map hostname patterns and IP scopes to Location/Role/Tenant for Not Imported devices, recomputed automatically after scans and rule changes
 - **Fast Path** — recurring Full Discovery runs skip SSH platform/credential discovery for devices whose SNMP identity matches stored state, with automatic self-correction on failure
 - **Bulk onboarding** — select Not Imported devices and onboard them as Nautobot Devices in one action, with Location/Role/Tenant filled from classification results and optional defaults
+- **Scales to large prefixes** — SNMP engine batching bounds peak memory on huge scan surfaces; per-phase concurrency knobs (TCP / SNMP / SSH) and configurable Celery time limits
 - **Inventory correlation** — each discovered IP is matched against Nautobot by primary IP, hostname, and serial, and persisted on a `DiscoveredDevice` record as `imported`, `new`, `partially_imported`, or `conflict`
 - Compatible with Nautobot v3.x
 
@@ -351,6 +352,46 @@ Avoid Fast Path during initial onboarding or frequent credential rotation;
 the first successful full run primes the stored state that makes a device
 eligible.
 
+### Scanning Large Prefixes
+
+Discovery Profiles can target very large scan surfaces (e.g. multiple /16
+prefixes). To keep worker memory bounded, SNMP discovery runs in **batches**:
+a configurable number of IPs is probed per pysnmp engine cycle before moving
+on to the next batch, so peak memory scales with the batch size rather than
+the total scan surface.
+
+Relevant controls:
+
+| Control | Where | Notes |
+|---------|-------|-------|
+| `snmp_engine_batch_size` | `PLUGINS_CONFIG` (default `1000`) | IPs per engine cycle; `0` disables batching. Effective SNMP concurrency is capped at this value — keep it ≥ SNMP scan concurrency. |
+| **SNMP Scan Concurrency** | per-job (SNMP/Full) | Concurrent SNMP probes; falls back to the generic concurrency input. |
+| **TCP Scan Concurrency** | per-job (Full) | Concurrent ping probes in Phase 1. |
+| **SSH Login Concurrency** | per-job (Full) | Concurrent SSH logins in Phase 3. |
+| **Maximum IP Addresses** | per-profile | Safety cap on scan-surface size. |
+
+Tuning guidance for `snmp_engine_batch_size`:
+
+| Scenario | Suggested value |
+|----------|-----------------|
+| Small scans (≤ /22) | default `1000` (effectively a single batch) |
+| Medium scans (/16) | `500`–`2000` |
+| Large scans (multiple /16s) | keep at `1000` or lower |
+| Memory-constrained workers | `250`–`500` (caps peak memory, more engine-recycle overhead) |
+
+### Celery Time Limits
+
+Long-running discovery jobs honor two plugin settings (seconds):
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `soft_time_limit` | `3600` | Raises `SoftTimeLimitExceeded` inside the job so it can fail gracefully. |
+| `time_limit` | `3900` | Hard backstop; the worker is forcibly terminated. Must be > `soft_time_limit`. |
+
+Changes take effect after `nautobot-server post_upgrade` (jobs are
+re-registered). Per-job Time Limit overrides in the Nautobot UI take
+precedence over these settings.
+
 ### Inventory Correlation
 
 Every discovered IP is recorded as a persistent `DiscoveredDevice` row and matched against the Nautobot inventory using three identifying attributes:
@@ -435,7 +476,10 @@ For SSH-discovered devices, vendor detection is done via keyword matching on com
 | `ssh_port_check` | `True` | TCP-port-check the host before attempting the SSH handshake |
 | `ssh_enable_password` | `""` | Enable password used when a device requires privilege escalation |
 | `ping_timeout` | `2` | ICMP ping timeout in seconds |
-| `concurrency` | `10` | Max concurrent probes |
+| `concurrency` | `10` | Max concurrent probes (fallback for protocol-specific knobs) |
+| `snmp_engine_batch_size` | `1000` | IPs per SNMP engine cycle (`0` = unbatched); caps effective SNMP concurrency |
+| `soft_time_limit` | `3600` | Celery soft time limit (seconds) for discovery jobs |
+| `time_limit` | `3900` | Celery hard time limit (seconds); must exceed `soft_time_limit` |
 
 ## Development
 

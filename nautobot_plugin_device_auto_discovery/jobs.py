@@ -727,6 +727,65 @@ def _expanded_hosts(networks, excluded):
     return hosts
 
 
+def _snmp_batch_size(config):
+    """Return the configured SNMP engine batch size (0 disables batching)."""
+    try:
+        return max(0, int(config.get("snmp_engine_batch_size", 1000)))
+    except (TypeError, ValueError):
+        return 1000
+
+
+def _iter_snmp_batches(hosts, config):
+    """Yield host batches bounded by ``snmp_engine_batch_size``.
+
+    Peak SNMP worker memory then scales with the batch size rather than the
+    total scan surface (pysnmp keeps per-target state on its engine). A
+    batch size of 0 disables batching — the entire scan is one batch.
+    """
+    batch_size = _snmp_batch_size(config)
+    if batch_size <= 0 or len(hosts) <= batch_size:
+        yield hosts
+        return
+    for start in range(0, len(hosts), batch_size):
+        yield hosts[start : start + batch_size]
+
+
+def _run_snmp_scan_batches(hosts, config, scan_function, job_logger=None, phase_name="SNMP"):
+    """Run ``scan_function`` over ``hosts`` in engine-bounded batches.
+
+    ``scan_function(batch_hosts)`` must scan one batch of hosts and return
+    its per-batch result dict (e.g. counters). Batches run sequentially so
+    each engine cycle is fully released before the next begins, mirroring
+    the Nautobot Device Discovery app's memory-bounding approach.
+
+    Returns:
+        dict mapping each top-level key to its summed numeric value (non
+        numeric values are ignored); plus ``batches`` (int) and
+        ``batch_size`` (int) for reporting.
+    """
+    batch_size = _snmp_batch_size(config)
+    totals = {}
+    batches = 0
+    for batch in _iter_snmp_batches(hosts, config):
+        batches += 1
+        if job_logger and batch_size > 0 and len(hosts) > batch_size:
+            job_logger.info(
+                "%s batch %d: scanning %d hosts (%d/%d)",
+                phase_name,
+                batches,
+                len(batch),
+                min(batches * batch_size, len(hosts)),
+                len(hosts),
+            )
+        result = scan_function(batch) or {}
+        for key, value in result.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                totals[key] = totals.get(key, 0) + value
+    totals["batches"] = batches
+    totals["batch_size"] = batch_size
+    return totals
+
+
 def _correlation_status_for(result_status):
     """Map a DiscoveryResult status to a DiscoveredDevice correlation status."""
     return {
@@ -1567,7 +1626,14 @@ class SNMPDiscoveryJob(Job):
         default=20,
         min_value=1,
         max_value=100,
-        description="Number of concurrent SNMP probes.",
+        description="Number of concurrent probes (fallback for protocol-specific concurrency).",
+    )
+    snmp_concurrency = IntegerVar(
+        required=False,
+        default=None,
+        min_value=1,
+        max_value=100,
+        description="Concurrent SNMP probes (advanced; capped by snmp_engine_batch_size). Falls back to 'concurrency'.",
     )
     populate_interfaces = BooleanVar(
         default=True,
@@ -1608,7 +1674,7 @@ class SNMPDiscoveryJob(Job):
     )
     dryrun = DryRunVar()
 
-    def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, populate_interfaces=True, populate_ip_addresses=True, populate_vrfs=True, include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False):
+    def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", timeout, concurrency, snmp_concurrency=None, populate_interfaces=True, populate_ip_addresses=True, populate_vrfs=True, include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False):
         config = get_plugin_config()
         snmp_version = str(snmp_version or "2c").strip().lower()
         if snmp_version.startswith("v"):
@@ -1640,6 +1706,26 @@ class SNMPDiscoveryJob(Job):
             self.logger.error("snmp_version '3' requires an SNMPv3 username (job input or profile secrets group).")
             return {"error": "snmp_version '3' requires an SNMPv3 username"}
 
+        # SNMP scan concurrency: dedicated knob, falling back to the generic
+        # concurrency setting; effective concurrency is capped at the engine
+        # batch size (keep snmp_engine_batch_size >= snmp_concurrency).
+        snmp_concurrency = int(snmp_concurrency or concurrency or config.get("concurrency", 20))
+        batch_size = _snmp_batch_size(config)
+        if batch_size > 0:
+            snmp_concurrency = max(1, min(snmp_concurrency, batch_size))
+            if batch_size < (snmp_concurrency or 0):
+                self.logger.warning(
+                    "snmp_engine_batch_size (%d) is smaller than the requested SNMP concurrency; "
+                    "effective concurrency capped to %d",
+                    batch_size,
+                    snmp_concurrency,
+                )
+        self.logger.info(
+            "SNMP concurrency: %d (batch size: %s)",
+            snmp_concurrency,
+            batch_size if batch_size > 0 else "unbatched",
+        )
+
         networks, excluded = _resolve_networks(target_network, profile)
         if not networks:
             self.logger.error("No valid target networks to scan (profile or target_network required).")
@@ -1665,72 +1751,91 @@ class SNMPDiscoveryJob(Job):
         total = len(hosts)
         self.logger.info("Starting SNMP discovery of %s (%d hosts)", network, total)
 
-        discovered = 0
-        created = 0
-        failed = 0
-        existing = 0
-        conflicts = 0
-        errors = []
-        lock = threading.Lock()
+        def scan_batch(batch_hosts):
+            """Scan one engine-bounded batch of hosts; returns batch counters."""
+            discovered = 0
+            created = 0
+            failed = 0
+            existing = 0
+            conflicts = 0
+            errors = []
+            lock = threading.Lock()
 
-        def scan_and_create(ip):
-            nonlocal discovered, created, failed, existing, conflicts
-            ip_str = str(ip)
-            try:
-                info = snmp_discover_device(ip_str, config)
-                if not info:
-                    return
-
-                with lock:
-                    discovered += 1
-
-                result_status, device, error, created_now = finalize_discovery(
-                    discovery_scan,
-                    ip_str,
-                    "snmp",
-                    info,
-                    config,
-                    auto_create=create_devices,
-                    dryrun=dryrun,
-                )
-
-                with lock:
-                    if created_now:
-                        created += 1
-                    elif result_status == "existing":
-                        existing += 1
-                    elif result_status == "failed":
-                        failed += 1
-                    elif result_status in ("partial", "conflict"):
-                        conflicts += 1
-
-                self.logger.info(
-                    "SNMP: %s -> %s (%s)%s",
-                    ip_str,
-                    info["hostname"],
-                    result_status,
-                    " [dry-run]" if dryrun else "",
-                )
-
-            except Exception as exc:
-                with lock:
-                    failed += 1
-                    errors.append(f"{ip_str}: {exc!r}")
-                self.logger.error("SNMP scan error for %s: %s", ip_str, exc)
-
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {executor.submit(scan_and_create, host): host for host in hosts}
-            for i, future in enumerate(as_completed(futures), 1):
-                if i % 64 == 0:
-                    self.logger.info("Processed %d / %d hosts", i, total)
+            def scan_and_create(ip):
+                nonlocal discovered, created, failed, existing, conflicts
+                ip_str = str(ip)
                 try:
-                    future.result()
-                except Exception:
-                    pass
+                    info = snmp_discover_device(ip_str, config)
+                    if not info:
+                        return
+
+                    with lock:
+                        discovered += 1
+
+                    result_status, device, error, created_now = finalize_discovery(
+                        discovery_scan,
+                        ip_str,
+                        "snmp",
+                        info,
+                        config,
+                        auto_create=create_devices,
+                        dryrun=dryrun,
+                    )
+
+                    with lock:
+                        if created_now:
+                            created += 1
+                        elif result_status == "existing":
+                            existing += 1
+                        elif result_status == "failed":
+                            failed += 1
+                        elif result_status in ("partial", "conflict"):
+                            conflicts += 1
+
+                    self.logger.info(
+                        "SNMP: %s -> %s (%s)%s",
+                        ip_str,
+                        info["hostname"],
+                        result_status,
+                        " [dry-run]" if dryrun else "",
+                    )
+
+                except Exception as exc:
+                    with lock:
+                        failed += 1
+                        errors.append(f"{ip_str}: {exc!r}")
+                    self.logger.error("SNMP scan error for %s: %s", ip_str, exc)
+
+            with ThreadPoolExecutor(max_workers=snmp_concurrency) as executor:
+                futures = {executor.submit(scan_and_create, host): host for host in batch_hosts}
+                for i, future in enumerate(as_completed(futures), 1):
+                    if i % 64 == 0:
+                        self.logger.info("Processed %d / %d hosts", i, len(batch_hosts))
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
+
+            return {
+                "discovered": discovered,
+                "created": created,
+                "failed": failed,
+                "existing": existing,
+                "conflicts": conflicts,
+                "error_count": len(errors),
+            }
+
+        totals = _run_snmp_scan_batches(hosts, config, scan_batch, job_logger=self.logger, phase_name="SNMP")
 
         cables_created = 0
         if config.get("create_cables", True):
             cables_created = link_neighbors_to_cables(discovery_scan, config)
+
+        discovered = totals.get("discovered", 0)
+        created = totals.get("created", 0)
+        existing = totals.get("existing", 0)
+        conflicts = totals.get("conflicts", 0)
+        failed = totals.get("failed", 0)
 
         discovery_scan.devices_discovered = discovered
         discovery_scan.devices_created = created
@@ -1753,7 +1858,8 @@ class SNMPDiscoveryJob(Job):
             "conflicts": conflicts,
             "failed": failed,
             "cables_created": cables_created,
-            "errors": errors[:10],
+            "batches": totals.get("batches", 1),
+            "batch_size": totals.get("batch_size", 0),
         }
 
 
@@ -2419,12 +2525,33 @@ class FullDiscoveryJob(Job):
         default=20,
         min_value=1,
         max_value=100,
-        description="Number of concurrent probes.",
+        description="Default number of concurrent probes (fallback for all phases).",
+    )
+    snmp_concurrency = IntegerVar(
+        required=False,
+        default=None,
+        min_value=1,
+        max_value=100,
+        description="Concurrent SNMP probes in Phase 2 (advanced; capped by snmp_engine_batch_size). Falls back to 'concurrency'.",
+    )
+    tcp_concurrency = IntegerVar(
+        required=False,
+        default=None,
+        min_value=1,
+        max_value=500,
+        description="Concurrent ping/TCP probes in Phase 1 (advanced). Falls back to 'concurrency'.",
+    )
+    ssh_concurrency = IntegerVar(
+        required=False,
+        default=None,
+        min_value=1,
+        max_value=100,
+        description="Concurrent SSH logins in Phase 3 (advanced). Falls back to 'concurrency'.",
     )
 
     def run(self, *, target_network, snmp_version, snmp_community, snmpv3_username="", snmpv3_auth_protocol="SHA", snmpv3_auth_key="", snmpv3_priv_protocol="AES", snmpv3_priv_key="", snmpv3_context_name="", ssh_username, ssh_password,
             enable_ping, enable_snmp, enable_ssh, populate_interfaces=True, populate_ip_addresses=True, populate_vrfs=True,
-            include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False, timeout, concurrency):
+            include_neighbors=True, include_vlans=True, populate_vlans=True, create_cables=True, profile=None, create_devices=True, dryrun=False, timeout, concurrency, snmp_concurrency=None, tcp_concurrency=None, ssh_concurrency=None):
         config = get_plugin_config()
         config["populate_interfaces"] = populate_interfaces
         config["populate_ip_addresses"] = populate_ip_addresses
@@ -2460,6 +2587,16 @@ class FullDiscoveryJob(Job):
         if not ssh_candidates:
             single = ssh_credential_from_config(config)
             ssh_candidates = [single] if single else []
+
+        # Phase-specific concurrency (advanced knobs; each falls back to the
+        # generic concurrency setting). Effective SNMP concurrency is capped
+        # at the engine batch size.
+        tcp_concurrency = int(tcp_concurrency or concurrency or 20)
+        ssh_concurrency = int(ssh_concurrency or min(concurrency or 20, 10))
+        snmp_concurrency = int(snmp_concurrency or concurrency or 20)
+        batch_size = _snmp_batch_size(config)
+        if batch_size > 0:
+            snmp_concurrency = max(1, min(snmp_concurrency, batch_size))
 
         networks, excluded = _resolve_networks(target_network, profile)
         if not networks:
@@ -2515,7 +2652,7 @@ class FullDiscoveryJob(Job):
 
         # Phase 1: Ping Sweep
         if enable_ping:
-            self.logger.info("Phase 1: Ping sweep")
+            self.logger.info("Phase 1: Ping sweep (concurrency %d)", tcp_concurrency)
             lock = threading.Lock()
 
             def check_alive(ip):
@@ -2523,7 +2660,7 @@ class FullDiscoveryJob(Job):
                     with lock:
                         live_hosts.add(str(ip))
 
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            with ThreadPoolExecutor(max_workers=tcp_concurrency) as executor:
                 futures = {executor.submit(check_alive, host): host for host in all_hosts}
                 for future in as_completed(futures):
                     try:
@@ -2535,51 +2672,98 @@ class FullDiscoveryJob(Job):
         else:
             live_hosts = {str(ip) for ip in all_hosts}
 
-        # Phase 2: SNMP Discovery
+        # Phase 2: SNMP Discovery (batched; sequential batches with bounded
+        # per-batch concurrency keep peak pysnmp engine memory predictable)
         snmp_results = {}
         if enable_snmp and live_hosts:
-            self.logger.info("Phase 2: SNMP discovery on %d live hosts", len(live_hosts))
+            self.logger.info("Phase 2: SNMP discovery on %d live hosts (concurrency %d)", len(live_hosts), snmp_concurrency)
             config["snmp_timeout"] = config.get("profile_snmp_timeout") or timeout
 
-            lock = threading.Lock()
-            for ip_str in live_hosts:
-                try:
-                    info = snmp_discover_device(ip_str, config)
-                    if info:
-                        with lock:
-                            discovered_hosts.add(ip_str)
-                            snmp_results[ip_str] = info
-                            total_discovered += 1
+            snmp_live = sorted(live_hosts)
 
-                        result_status, device, error, created_now = finalize_discovery(
-                            discovery_scan,
-                            ip_str,
-                            "snmp",
-                            info,
-                            config,
-                            auto_create=create_devices,
-                            dryrun=dryrun,
-                        )
+            def snmp_batch_scan(batch_hosts):
+                batch_lock = threading.Lock()
+                batch_results = {}
 
-                        with lock:
-                            if created_now:
-                                total_created += 1
-                            elif result_status == "existing":
-                                total_existing += 1
-                            elif result_status == "failed":
-                                total_failed += 1
-                            elif result_status in ("partial", "conflict"):
-                                total_conflicts += 1
+                for ip_str in batch_hosts:
+                    try:
+                        info = snmp_discover_device(ip_str, config)
+                        if info:
+                            with batch_lock:
+                                batch_results[ip_str] = info
 
-                        self.logger.info(
-                            "SNMP: %s -> %s (%s)%s",
-                            ip_str, info["hostname"], result_status,
-                            " [dry-run]" if dryrun else "",
-                        )
+                            result_status, device, error, created_now = finalize_discovery(
+                                discovery_scan,
+                                ip_str,
+                                "snmp",
+                                info,
+                                config,
+                                auto_create=create_devices,
+                                dryrun=dryrun,
+                            )
 
-                except Exception as exc:
-                    total_failed += 1
-                    self.logger.error("SNMP error for %s: %s", ip_str, exc)
+                            with batch_lock:
+                                if created_now:
+                                    pass  # counted via totals below
+                            self.logger.info(
+                                "SNMP: %s -> %s (%s)%s",
+                                ip_str, info["hostname"], result_status,
+                                " [dry-run]" if dryrun else "",
+                            )
+
+                    except Exception as exc:
+                        self.logger.error("SNMP error for %s: %s", ip_str, exc)
+
+                return batch_results
+
+            # Run batches with a bounded thread pool within each batch
+            def run_batch(batch_hosts):
+                lock = threading.Lock()
+                batch_results = {}
+
+                def probe(ip_str):
+                    try:
+                        info = snmp_discover_device(ip_str, config)
+                        if info:
+                            result_status, device, error, created_now = finalize_discovery(
+                                discovery_scan,
+                                ip_str,
+                                "snmp",
+                                info,
+                                config,
+                                auto_create=create_devices,
+                                dryrun=dryrun,
+                            )
+                            with lock:
+                                batch_results[ip_str] = info
+                                if created_now:
+                                    pass
+                            self.logger.info(
+                                "SNMP: %s -> %s (%s)%s",
+                                ip_str, info["hostname"], result_status,
+                                " [dry-run]" if dryrun else "",
+                            )
+                    except Exception as exc:
+                        self.logger.error("SNMP error for %s: %s", ip_str, exc)
+
+                with ThreadPoolExecutor(max_workers=snmp_concurrency) as executor:
+                    futures = {executor.submit(probe, host): host for host in batch_hosts}
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception:
+                            pass
+                return batch_results
+
+            for batch in _iter_snmp_batches(snmp_live, config):
+                if _snmp_batch_size(config) > 0 and len(snmp_live) > _snmp_batch_size(config):
+                    self.logger.info("SNMP batch: %d hosts", len(batch))
+                batch_results = run_batch(batch)
+                with threading.Lock():
+                    snmp_results.update(batch_results)
+                    for ip_str in batch_results:
+                        discovered_hosts.add(ip_str)
+                        total_discovered += 1
 
             self.logger.info("SNMP discovered %d devices", len(snmp_results))
 
@@ -2676,7 +2860,7 @@ class FullDiscoveryJob(Job):
                     self.logger.debug("Fast Path skipped for %s: %s", ip_str, value)
                 _collect_and_finalize(ip_str, ssh_candidates, False)
 
-            with ThreadPoolExecutor(max_workers=min(concurrency, 10)) as executor:
+            with ThreadPoolExecutor(max_workers=ssh_concurrency) as executor:
                 futures = {executor.submit(ssh_scan, ip_str): ip_str for ip_str in ssh_targets}
                 for future in as_completed(futures):
                     try:
@@ -3735,6 +3919,35 @@ class OnboardDiscoveredDevicesJob(Job):
             "dryrun": dryrun,
         }
 
+
+def _apply_configured_time_limits():
+    """Apply plugin-configured Celery time limits to the long-running jobs.
+
+    ``soft_time_limit`` / ``time_limit`` under
+    ``PLUGINS_CONFIG["nautobot_plugin_device_auto_discovery"]`` override each
+    job's ``Meta`` defaults. Takes effect at import/registration time (i.e.
+    after the next ``nautobot-server post_upgrade``), matching the Nautobot
+    Device Discovery app's behavior. A value of 0 or None leaves the job's
+    class-level default untouched.
+    """
+    config = get_plugin_config()
+    soft = config.get("soft_time_limit")
+    hard = config.get("time_limit")
+    if soft and hard and hard <= soft:
+        logger.warning(
+            "time_limit (%s) must be greater than soft_time_limit (%s); ignoring configured time limits",
+            hard,
+            soft,
+        )
+        return
+    for job_class in (FullDiscoveryJob, CrawlDiscoveryJob, VRFRouteDiscoveryJob, SNMPDiscoveryJob, SSHDiscoveryJob):
+        if soft:
+            job_class.soft_time_limit = int(soft)
+        if hard:
+            job_class.time_limit = int(hard)
+
+
+_apply_configured_time_limits()
 
 register_jobs(
     PingSweepJob,

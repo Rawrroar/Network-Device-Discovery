@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nautobot-plugin-device-auto-discovery"
-version = "0.7.0"
+version = "0.8.0"
 description = "A Nautobot plugin for automatic network device discovery via ICMP, SNMP, and SSH."
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -25,6 +25,7 @@ dependencies = [
     "nautobot>=3.0,<4.0",
     "pysnmp>=4.4",
     "paramiko>=3.0",
+    "netaddr>=0.8",
 ]
 
 [project.urls]

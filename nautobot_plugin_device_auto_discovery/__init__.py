@@ -22,6 +22,9 @@ DEFAULT_PLUGINS_CONFIG = {
     "ssh_enable_password": "",
     "ping_timeout": 2,
     "concurrency": 10,
+    "snmp_engine_batch_size": 1000,
+    "soft_time_limit": 3600,
+    "time_limit": 3900,
     "populate_interfaces": True,
     "populate_ip_addresses": True,
     "populate_vrfs": True,
@@ -36,7 +39,7 @@ DEFAULT_PLUGINS_CONFIG = {
 class DeviceAutoDiscoveryConfig(NautobotAppConfig):
     name = "nautobot_plugin_device_auto_discovery"
     verbose_name = "Device Auto-Discovery"
-    version = "0.7.0"
+    version = "0.8.0"
     author = "Developer"
     author_email = "dev@example.com"
     description = "Automatic network device discovery via ICMP ping, SNMP, and SSH."

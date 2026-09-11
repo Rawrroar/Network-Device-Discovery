@@ -19,6 +19,7 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - Configurable defaults for device location, role, status, and tags
 - Threaded/concurrent scanning for fast results
 - Dry-run mode for SNMP, SSH, and Full jobs
+- **Network Device Discovery** — one consolidated, profile-first job: pick a Discovery Profile and the scan scope, protocols, credentials, and Fast Path all come from the profile. Launch it from the profile's **Run Device Discovery** button.
 - **Cable linking** — creates `dcim.Cable` objects from LLDP/CDP neighbor data when both ends can be resolved
 - **Crawl Discovery** — iteratively discovers devices from a seed device by following LLDP/CDP neighbors hop by hop
 - **DiscoveryProfiles** — reusable scan-scope and settings (prefixes, exclusions, IP cap, ports, timeouts, domain stripping) applied to the SNMP, Full, and Crawl jobs
@@ -176,6 +177,17 @@ stored on the `DiscoveryResult` (`discovered_data.command_outputs`) for review,
 including in dry-run mode.
 
 > **Recommendation:** Store credentials in Nautobot Secrets (using Environment Variables or Vault provider) and paste the values into the job inputs.
+
+### Network Device Discovery
+
+The consolidated, profile-first job (recommended for recurring scans):
+
+1. Create a **Discovery Profile** (prefixes, protocols, credentials, Fast Path)
+2. Open the profile and click **Run Device Discovery**, or run **Jobs > Network Device Discovery** and select the profile
+3. The profile's `protocols` list drives the phase selection — `ping`, `snmp`, and/or `ssh`
+4. Optionally tick **Dry-run** first to preview what would be discovered
+
+The job reuses the Full Discovery engine (batched SNMP, per-phase concurrency, Fast Path, correlation, cable linking), so the two are interchangeable — this one just cannot run without a profile.
 
 ### Full Discovery
 

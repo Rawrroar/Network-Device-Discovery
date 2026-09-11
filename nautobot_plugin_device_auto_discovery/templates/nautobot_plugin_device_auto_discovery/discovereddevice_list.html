@@ -22,3 +22,12 @@
         }
     </script>
 {% endblock %}
+
+{% block buttons %}
+    {{ block.super }}
+    {% if perms.nautobot_plugin_device_auto_discovery.add_discoveryprofile %}
+        <a href="{% url 'plugins:nautobot_plugin_device_auto_discovery:discoveryprofile_list' %}" class="btn btn-default">
+            <span class="mdi mdi-radar" aria-hidden="true"></span> Run Device Discovery
+        </a>
+    {% endif %}
+{% endblock %}

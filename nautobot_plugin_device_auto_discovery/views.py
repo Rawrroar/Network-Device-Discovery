@@ -3,7 +3,7 @@
 from django import forms as django_forms
 from django.contrib import messages
 from django.shortcuts import redirect, reverse
-from nautobot.apps.ui import ObjectDetailContent, ObjectFieldsPanel, ObjectsTablePanel, SectionChoices
+from nautobot.apps.ui import Button, ButtonColorChoices, ObjectDetailContent, ObjectFieldsPanel, ObjectsTablePanel, SectionChoices
 from nautobot.apps.views import NautobotUIViewSet
 from nautobot.dcim.models import Location
 from nautobot.extras.models import Job, JobResult, Role
@@ -14,6 +14,8 @@ from rest_framework.response import Response
 
 from nautobot_plugin_device_auto_discovery import filtersets, forms, models, tables
 from nautobot_plugin_device_auto_discovery.api import serializers
+
+_NETWORK_DISCOVERY_JOB_CLASS_PATH = "nautobot_plugin_device_auto_discovery.jobs.NetworkDeviceDiscoveryJob"
 
 
 class DiscoveredDeviceOnboardForm(django_forms.Form):
@@ -47,6 +49,16 @@ class DiscoveredDeviceOnboardForm(django_forms.Form):
     )
 
 
+class RunDiscoveryForm(django_forms.Form):
+    """Form for the Run Device Discovery action on a Discovery Profile."""
+
+    dryrun = django_forms.BooleanField(
+        initial=False,
+        required=False,
+        help_text="Discover and record results without creating Nautobot objects.",
+    )
+
+
 class DiscoveryProfileUIViewSet(NautobotUIViewSet):
     bulk_update_form_class = forms.DiscoveryProfileBulkEditForm
     filterset_class = filtersets.DiscoveryProfileFilterSet
@@ -55,6 +67,99 @@ class DiscoveryProfileUIViewSet(NautobotUIViewSet):
     queryset = models.DiscoveryProfile.objects.all()
     serializer_class = serializers.DiscoveryProfileSerializer
     table_class = tables.DiscoveryProfileTable
+    object_detail_content = ObjectDetailContent(
+        panels=(
+            ObjectFieldsPanel(
+                label="Profile",
+                section=SectionChoices.LEFT_HALF,
+                weight=100,
+                fields=(
+                    "description",
+                    "included_ip_prefixes",
+                    "excluded_ip_prefixes",
+                    "maximum_ip_addresses",
+                    "protocols",
+                    "status",
+                ),
+            ),
+            ObjectFieldsPanel(
+                label="Scan Settings",
+                section=SectionChoices.RIGHT_HALF,
+                weight=100,
+                fields=(
+                    "ssh_port",
+                    "snmp_port",
+                    "snmp_timeout",
+                    "snmp_retries",
+                    "snmpv3_auth_protocol",
+                    "snmpv3_priv_protocol",
+                    "fast_path",
+                    "strip_domain_suffixes",
+                    "secrets_groups",
+                ),
+            ),
+        ),
+        extra_buttons=(
+            Button(
+                label="Run Device Discovery",
+                color=ButtonColorChoices.GREEN,
+                icon="mdi-radar",
+                link_name="plugins:nautobot_plugin_device_auto_discovery:discoveryprofile_run-discovery",
+                weight=100,
+            ),
+        ),
+    )
+
+    @action(methods=["get", "post"], detail=True, url_path="run-discovery", url_name="run-discovery")
+    def run_discovery(self, request, *args, **kwargs):
+        """Enqueue the Network Device Discovery job for this profile."""
+        profile = self.get_object()
+        if request.method == "POST":
+            form = RunDiscoveryForm(request.POST)
+            if form.is_valid():
+                try:
+                    job_model = Job.objects.get_for_class_path(_NETWORK_DISCOVERY_JOB_CLASS_PATH)
+                except Job.DoesNotExist:
+                    messages.error(
+                        request,
+                        "The Network Device Discovery job is not registered. "
+                        "Run nautobot-server post_upgrade to sync jobs.",
+                    )
+                    return redirect("plugins:nautobot_plugin_device_auto_discovery:discoveryprofile", pk=profile.pk)
+                job_data = {
+                    "profile": profile.pk,
+                    "target_network": str(profile.included_ip_prefixes[0]) if profile.included_ip_prefixes else "0.0.0.0/32",
+                    "snmp_version": "2c",
+                    "snmp_community": "",
+                    "snmpv3_username": "",
+                    "snmpv3_auth_key": "",
+                    "snmpv3_priv_key": "",
+                    "snmpv3_context_name": "",
+                    "ssh_username": "",
+                    "ssh_password": "",
+                    "enable_ping": "ping" in (profile.protocols or []),
+                    "enable_snmp": "snmp" in (profile.protocols or []),
+                    "enable_ssh": "ssh" in (profile.protocols or []),
+                    "dryrun": bool(form.cleaned_data["dryrun"]),
+                }
+                job_result = JobResult.enqueue_job(
+                    job_model=job_model,
+                    user=request.user,
+                    job_kwargs=job_data,
+                )
+                return redirect("extras:jobresult_detail", pk=job_result.pk)
+
+        return Response(
+            {
+                "profile": profile,
+                "form": RunDiscoveryForm(),
+                "run_url": reverse(
+                    "plugins:nautobot_plugin_device_auto_discovery:discoveryprofile_run-discovery",
+                    kwargs={"pk": profile.pk},
+                ),
+            },
+            template_name="nautobot_plugin_device_auto_discovery/discoveryprofile_run_discovery.html",
+        )
 
 
 class DiscoveryScanUIViewSet(NautobotUIViewSet):

@@ -2913,6 +2913,72 @@ class FullDiscoveryJob(Job):
 
 
 # ------------------------------------------------------------------ #
+#  Job: Network Device Discovery (consolidated, profile-first)         #
+# ------------------------------------------------------------------ #
+
+
+class NetworkDeviceDiscoveryJob(FullDiscoveryJob):
+    """Profile-first consolidated discovery job (ping + SNMP + SSH).
+
+    Same three-phase engine as Full Discovery, but designed to be launched
+    from a Discovery Profile (or with a profile selected in the job form):
+    scan scope, protocols, ports, credentials, and Fast Path all come from
+    the profile, with the job inputs acting as overrides/fallbacks.
+
+    The profile's ``protocols`` list pre-selects the phase toggles; any
+    protocol explicitly listed in the profile is always enabled even if the
+    corresponding toggle was somehow cleared, so a profile is self-describing.
+    """
+
+    class Meta:
+        name = "Network Device Discovery"
+        description = """
+        Discover network devices using SNMP and SSH across the prefixes of a
+        Discovery Profile.
+
+        Phases:
+        1. **Ping Sweep** — find live hosts (skipped when the profile's
+           protocols do not include 'ping')
+        2. **SNMP Discovery** — query live hosts for identity and MIB tables
+        3. **SSH Discovery** — collect data from hosts not identified by SNMP
+           (honoring Fast Path when enabled on the profile)
+
+        Credentials are resolved from the profile's Secrets Groups; scan
+        scope, ports, and timeouts come from the profile. Correlation status
+        per IP is recorded on DiscoveredDevice records.
+        """
+        dryrun_default = True
+        has_sensitive_variables = True
+        soft_time_limit = 1800
+        time_limit = 3600
+        template_name = "nautobot_plugin_device_auto_discovery/snmp_job_form.html"
+
+    def run(self, *args, **kwargs):
+        """Force profile resolution, then delegate to the Full engine."""
+        profile = kwargs.get("profile")
+        if profile is None:
+            self.logger.error(
+                "Network Device Discovery requires a Discovery Profile (select one on the job form "
+                "or launch it from a profile's Run Device Discovery button)."
+            )
+            return {"error": "A Discovery Profile is required"}
+
+        protocols = set(profile.protocols or [])
+        if protocols:
+            # Profile protocols are authoritative for phase selection.
+            kwargs["enable_ping"] = "ping" in protocols
+            kwargs["enable_snmp"] = "snmp" in protocols
+            kwargs["enable_ssh"] = "ssh" in protocols
+            self.logger.info(
+                "Profile %s protocols: %s",
+                profile.name,
+                ", ".join(sorted(protocols)) or "(none)",
+            )
+
+        return super().run(*args, **kwargs)
+
+
+# ------------------------------------------------------------------ #
 #  Job: Crawl Discovery                                               #
 # ------------------------------------------------------------------ #
 
@@ -3940,7 +4006,14 @@ def _apply_configured_time_limits():
             soft,
         )
         return
-    for job_class in (FullDiscoveryJob, CrawlDiscoveryJob, VRFRouteDiscoveryJob, SNMPDiscoveryJob, SSHDiscoveryJob):
+    for job_class in (
+        FullDiscoveryJob,
+        NetworkDeviceDiscoveryJob,
+        CrawlDiscoveryJob,
+        VRFRouteDiscoveryJob,
+        SNMPDiscoveryJob,
+        SSHDiscoveryJob,
+    ):
         if soft:
             job_class.soft_time_limit = int(soft)
         if hard:
@@ -3954,6 +4027,7 @@ register_jobs(
     SNMPDiscoveryJob,
     SSHDiscoveryJob,
     FullDiscoveryJob,
+    NetworkDeviceDiscoveryJob,
     CrawlDiscoveryJob,
     VRFRouteDiscoveryJob,
     OnboardDiscoveredDevicesJob,

@@ -1,0 +1,46 @@
+{% extends "generic/object_detail.html" %}
+
+{% block title %}Onboard Discovered Devices{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-6 col-md-offset-3">
+        <div class="panel panel-default">
+            <div class="panel-heading">
+                <strong>Onboard {{ selected_count }} discovered device(s)</strong>
+            </div>
+            <div class="panel-body">
+                {% if selected_count == 0 %}
+                    <div class="alert alert-warning">No devices were selected for onboarding.</div>
+                {% else %}
+                    <p>
+                        Devices marked <em>Not Imported</em> will be created as Nautobot Devices.
+                        With <strong>Fill From Classification</strong> enabled, each device's Location,
+                        Role, and Tenant come from its Automated Classification results, falling back
+                        to the defaults below. Disable it to apply the defaults to every device
+                        (Default Location and Default Role are then required).
+                    </p>
+                    <form method="post" action="{{ onboard_url }}">
+                        {% csrf_token %}
+                        <input type="hidden" name="pk_list" value="{{ form.pk_list.value }}" />
+                        {% for field in form.visible_fields %}
+                            {% if field.name != 'pk_list' %}
+                                <div class="form-group{% if field.errors %} has-error{% endif %}">
+                                    {{ field.label_tag }}
+                                    {{ field }}
+                                    {% if field.help_text %}<span class="help-block">{{ field.help_text }}</span>{% endif %}
+                                    {% for error in field.errors %}<span class="help-block text-danger">{{ error }}</span>{% endfor %}
+                                </div>
+                            {% endif %}
+                        {% endfor %}
+                        <div class="text-right">
+                            <a href="{% url 'plugins:nautobot_plugin_device_auto_discovery:discovereddevice_list' %}" class="btn btn-link">Cancel</a>
+                            <button type="submit" class="btn btn-primary">Onboard {{ selected_count }} Device(s)</button>
+                        </div>
+                    </form>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

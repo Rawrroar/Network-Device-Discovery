@@ -1,0 +1,24 @@
+{% extends "generic/object_list.html" %}
+
+{% block bulk_buttons %}
+    {{ block.super }}
+    {% if perms.nautobot_plugin_device_auto_discovery.change_discovereddevice %}
+        <button type="button" class="btn btn-primary btn-sm"
+                onclick="onboardSelectedDevices()">
+            <span class="mdi mdi-download-network-outline" aria-hidden="true"></span> Onboard Selected Devices
+        </button>
+    {% endif %}
+    <script>
+        function onboardSelectedDevices() {
+            const form = document.getElementById("object_list_form");
+            const checked = Array.from(form.querySelectorAll('input[name="pk"]:checked'))
+                .map(function (el) { return el.value; });
+            if (!checked.length) {
+                alert("Please select one or more devices to onboard.");
+                return;
+            }
+            const url = "{% url 'plugins:nautobot_plugin_device_auto_discovery:discovereddevice_onboard' %}";
+            window.location.href = url + "?" + checked.map(function (pk) { return "pk=" + pk; }).join("&");
+        }
+    </script>
+{% endblock %}

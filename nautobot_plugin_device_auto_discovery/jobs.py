@@ -16,6 +16,7 @@ import netaddr
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
 from django.utils import timezone
 from netaddr import IPNetwork, IPAddress
 
@@ -3500,6 +3501,241 @@ class VRFRouteDiscoveryJob(Job):
                     )
                 except Exception as exc:
                     self.logger.debug("Failed to create IPAddress %s: %s", address, exc)
+# ------------------------------------------------------------------ #
+#  Job: Onboard Discovered Devices                                     #
+# ------------------------------------------------------------------ #
+
+
+class OnboardDiscoveredDevicesJob(Job):
+    """Create Nautobot Devices from selected Not Imported discovered devices.
+
+    Invoked from the "Onboard Selected Devices" bulk action on the
+    Discovered Devices list view. For each selected device:
+
+    1. Location, Role, and Tenant are taken from the device's automated
+       classification results when ``fill_from_classification`` is enabled.
+    2. Any value classification did not supply falls back to the job's
+       Default Location / Role / Tenant inputs.
+    3. The device is created (or matched) via the same inventory-correlation
+       path used by the discovery jobs, and the DiscoveredDevice record is
+       linked to the resulting Nautobot Device.
+    """
+
+    class Meta:
+        name = "Onboard Discovered Devices"
+        description = """
+        Onboard Not Imported discovered devices into Nautobot as Devices.
+
+        Devices are created from the identity data captured during discovery.
+        When classification results exist and 'fill from classification' is
+        enabled, each device's Location, Role, and Tenant come from its
+        Automated Classification; the defaults below are used as fallbacks.
+        Disable 'fill from classification' to apply the defaults to every
+        device (a Default Location and Default Role are required in that case).
+        """
+        dryrun_default = True
+        soft_time_limit = 600
+
+    pk_list = TextVar(
+        description="Comma-separated list of DiscoveredDevice IDs to onboard.",
+    )
+    namespace = ObjectVar(
+        model=Namespace,
+        required=False,
+        description="Namespace for the device's primary IP address (defaults to the Global namespace).",
+    )
+    default_location = ObjectVar(
+        model=Location,
+        required=False,
+        description="Fallback location when a device has no classification result.",
+    )
+    default_role = ObjectVar(
+        model=Role,
+        required=False,
+        description="Fallback role when a device has no classification result.",
+    )
+    default_tenant = ObjectVar(
+        model=Tenant,
+        required=False,
+        description="Fallback tenant when a device has no classification result.",
+    )
+    fill_from_classification = BooleanVar(
+        default=True,
+        description="Use each device's automated classification results, falling back to the defaults above.",
+    )
+    dryrun = DryRunVar()
+
+    def run(  # pylint: disable=arguments-differ
+        self,
+        *,
+        pk_list,
+        namespace=None,
+        default_location=None,
+        default_role=None,
+        default_tenant=None,
+        fill_from_classification=True,
+        dryrun=False,
+    ):
+        from .classification import _model_for_rule  # reuse the model-resolution helper
+        from .models import DeviceClassificationRule, DiscoveredDeviceClassification
+
+        if isinstance(pk_list, str):
+            pks = [pk.strip() for pk in pk_list.split(",") if pk.strip()]
+        else:
+            pks = [str(pk).strip() for pk in pk_list if str(pk).strip()]
+
+        devices = DiscoveredDevice.objects.filter(pk__in=pks)
+        if not devices:
+            self.logger.error("No DiscoveredDevice records matched the provided selection.")
+            return {"error": "No DiscoveredDevice records matched the provided selection"}
+
+        if not fill_from_classification and (default_location is None or default_role is None):
+            self.logger.error(
+                "A Default Location and Default Role are required when 'fill from classification' is disabled."
+            )
+            return {"error": "A Default Location and Default Role are required when 'fill from classification' is disabled"}
+
+        config = get_plugin_config()
+
+        onboarding_scan = DiscoveryScan.objects.create(
+            name=f"Onboard {devices.count()} discovered device(s)",
+            scan_method=DiscoveryScan.ScanMethod.SNMP,
+            status="running",
+        )
+
+        onboarding_location_model = None
+        classification_model_map = {
+            DeviceClassificationRule.ClassifyAs.LOCATION: (Location, default_location),
+            DeviceClassificationRule.ClassifyAs.ROLE: (Role, default_role),
+            DeviceClassificationRule.ClassifyAs.TENANT: (Tenant, default_tenant),
+        }
+
+        onboarding_onboarded = 0
+        onboarding_existing = 0
+        onboarding_failed = 0
+        onboarding_errors = []
+
+        for discovered in devices:
+            if discovered.status != DiscoveredDevice.CorrelationStatus.NEW:
+                self.logger.warning(
+                    "Skipping %s (%s): status is %s, only Not Imported devices can be onboarded",
+                    discovered.ip_address,
+                    discovered.hostname or "unknown",
+                    discovered.status,
+                )
+                onboarding_failed += 1
+                onboarding_errors.append(f"{discovered.ip_address}: status {discovered.status}, not on-boardable")
+                continue
+
+            hostname = discovered.hostname or discovered.ip_address
+            vendor = discovered.vendor or ""
+            model = discovered.model or ""
+            serial = discovered.serial or ""
+            os_version = discovered.os_version or ""
+
+            classification_values = {"location": None, "role": None, "tenant": None}
+            if fill_from_classification:
+                for classification in discovered.classifications.select_related("matched_object_type"):
+                    target = classification.classify_as
+                    if target in classification_values and classification.matched_object_id:
+                        target_model, fallback = classification_model_map[target]
+                        if _model_for_rule(
+                            DeviceClassificationRule(
+                                classify_as=target, match_against=f"{target_model._meta.app_label}.{target_model._meta.model_name}"
+                            )
+                        ):
+                            instance = target_model.objects.filter(pk=classification.matched_object_id).first()
+                            if instance:
+                                classification_values[target] = instance
+
+            location = classification_values["location"] or default_location
+            role = classification_values["role"] or default_role
+            tenant = classification_values["tenant"] or default_tenant
+
+            if dryrun:
+                self.logger.info(
+                    "[DRYRUN] Would onboard %s (%s) with location=%s, role=%s, tenant=%s",
+                    hostname,
+                    discovered.ip_address,
+                    getattr(location, "name", None) or "(unset)",
+                    getattr(role, "name", None) or "(unset)",
+                    getattr(tenant, "name", None) or "(unset)",
+                )
+                onboarding_onboarded += 1
+                continue
+
+            try:
+                with transaction.atomic():
+                    device, result_status, error = create_device_in_nautobot(
+                        hostname,
+                        discovered.ip_address,
+                        vendor,
+                        model,
+                        serial,
+                        os_version,
+                        {
+                            "platform_name": discovered.network_driver,
+                            "manufacturer_name": vendor,
+                            "network_driver": discovered.network_driver,
+                        },
+                        {
+                            **config,
+                            "default_location": getattr(location, "name", "") or config.get("default_location", "Unknown"),
+                            "default_role": getattr(role, "name", "") or config.get("default_role", "Network Device"),
+                            "default_status": config.get("default_status", "Active"),
+                            "default_tags": config.get("default_tags", ["auto-discovered"]),
+                        },
+                        onboarding_scan,
+                    )
+                    if device is None:
+                        raise RuntimeError(error or "device creation failed")
+
+                    if tenant is not None and not device.tenant:
+                        device.tenant = tenant
+                        device.save(update_fields=["tenant"])
+
+                    discovered.device = device
+                    discovered.status = (
+                        DiscoveredDevice.CorrelationStatus.IMPORTED if result_status == "existing"
+                        else DiscoveredDevice.CorrelationStatus.NEW
+                    )
+                    discovered.ssh_issue = ""
+                    discovered.save(update_fields=["device", "status", "ssh_issue"])
+
+                if result_status == "existing":
+                    onboarding_existing += 1
+                    self.logger.info("Onboarded (existing): %s -> %s", discovered.ip_address, device.name)
+                else:
+                    onboarding_onboarded += 1
+                    self.logger.info("Onboarded: %s -> %s", discovered.ip_address, device.name)
+
+            except Exception as exc:
+                onboarding_failed += 1
+                onboarding_errors.append(f"{discovered.ip_address}: {exc}")
+                self.logger.error("Failed to onboard %s: %s", discovered.ip_address, exc)
+
+        onboarding_scan.devices_discovered = onboarding_onboarded + onboarding_existing
+        onboarding_scan.devices_created = onboarding_onboarded
+        onboarding_scan.status = "completed"
+        onboarding_scan.save()
+
+        summary = (
+            f"Onboarding complete: {onboarding_onboarded} created, "
+            f"{onboarding_existing} existing, {onboarding_failed} failed"
+        )
+        self.logger.info(summary)
+
+        return {
+            "scan": onboarding_scan.pk,
+            "selected": len(pks),
+            "onboarded": onboarding_onboarded,
+            "existing": onboarding_existing,
+            "failed": onboarding_failed,
+            "errors": onboarding_errors[:20],
+            "dryrun": dryrun,
+        }
+
+
 register_jobs(
     PingSweepJob,
     SNMPDiscoveryJob,
@@ -3507,4 +3743,5 @@ register_jobs(
     FullDiscoveryJob,
     CrawlDiscoveryJob,
     VRFRouteDiscoveryJob,
+    OnboardDiscoveredDevicesJob,
 )

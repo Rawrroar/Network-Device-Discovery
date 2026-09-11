@@ -25,6 +25,7 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - **Secrets-based credentials** — SSH and SNMP credentials resolved from weighted Secrets Groups assigned to a profile; the last-known-working SSH group is remembered per device, and SNMPv3 security levels are derived from the secrets present (no credentials in `PLUGINS_CONFIG`)
 - **Automated classification** — weighted rules map hostname patterns and IP scopes to Location/Role/Tenant for Not Imported devices, recomputed automatically after scans and rule changes
 - **Fast Path** — recurring Full Discovery runs skip SSH platform/credential discovery for devices whose SNMP identity matches stored state, with automatic self-correction on failure
+- **Bulk onboarding** — select Not Imported devices and onboard them as Nautobot Devices in one action, with Location/Role/Tenant filled from classification results and optional defaults
 - **Inventory correlation** — each discovered IP is matched against Nautobot by primary IP, hostname, and serial, and persisted on a `DiscoveredDevice` record as `imported`, `new`, `partially_imported`, or `conflict`
 - Compatible with Nautobot v3.x
 
@@ -296,6 +297,27 @@ Example — classify Location from a site code in hostnames like `ams-core-01`:
 | Match Against | `dcim.location` |
 | Match Field | `name` |
 | Match Operator | `iexact` |
+
+### Onboarding Discovered Devices
+
+Devices marked **Not Imported** can be onboarded directly from the discovery
+results:
+
+1. Select the device(s) on the **Discovered Devices** list view
+2. Click **Onboard Selected Devices**
+3. In the form, only the defaults are optional when **Fill From
+   Classification** is enabled: each device's Location, Role, and Tenant come
+   from its Automated Classification results, falling back to the Default
+   Location / Role / Tenant you provide. Disable it to apply the defaults to
+   every device (Default Location and Default Role are then required).
+4. Submit — the **Onboard Discovered Devices** job creates the Device records
+   and links them back to their `DiscoveredDevice` entries
+
+The onboarding job can also be run (or scheduled) directly from **Jobs**:
+it takes the same parameters plus a comma-separated list of DiscoveredDevice
+IDs. Only Not Imported devices are onboarded; already-matched devices are
+skipped, and a device that already exists in Nautobot (matched by primary IP,
+hostname, or serial) is linked rather than duplicated.
 
 ### Fast Path
 

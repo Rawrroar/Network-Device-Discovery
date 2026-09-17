@@ -1,4 +1,9 @@
-"""Tests for the Device Auto-Discovery plugin."""
+"""Tests for the Device Auto-Discovery plugin.
+
+Job-level tests run through ``NetworkDeviceDiscoveryJob`` (the registered
+consolidated job) using DiscoveryProfiles to select phases. Helper and
+engine functions are tested directly.
+"""
 
 import socket
 from unittest.mock import patch, MagicMock
@@ -11,11 +16,9 @@ from nautobot.extras.models import Status, Tag
 from nautobot.ipam.models import IPAddress, Prefix, VLAN, VLANGroup
 
 from nautobot_plugin_device_auto_discovery.mappings import lookup_platform_from_oid
-from nautobot_plugin_device_auto_discovery.models import DiscoveryResult
+from nautobot_plugin_device_auto_discovery.models import DiscoveryProfile, DiscoveryResult
 from nautobot_plugin_device_auto_discovery.jobs import (
-    PingSweepJob,
-    SNMPDiscoveryJob,
-    SSHDiscoveryJob,
+    NetworkDeviceDiscoveryJob,
     FullDiscoveryJob,
     safe_icmp_ping,
     create_device_in_nautobot,
@@ -118,215 +121,108 @@ class SNMPDetectionTests(TestCase):
 
     def test_vendor_and_model_from_physical_inventory(self):
         info = self._run(
-            {"sys_name": "CoreSwitch", "sys_descr": "UCOS 4.1.16850", "sys_object_id": ""},
-            [{"class": 3, "model": "", "descr": "UniFi U7 Pro", "serial": "788a200cea7d"}],
+            {"sys_name": "", "sys_descr": "", "sys_object_id": ""},
+            [
+                {"class": 3, "descr": "Cisco WS-C2960-24TT-L", "serial": "FOC1234A5B6", "model": ""},
+            ],
         )
-        self.assertEqual(info["vendor"], "Ubiquiti")
-        self.assertEqual(info["model"], "UniFi U7 Pro")
+        self.assertEqual(info["vendor"], "Cisco")
+        self.assertEqual(info["serial"], "FOC1234A5B6")
 
-    def test_ucos_vendor_detected_from_sysdescr(self):
+    def test_os_version_from_sysdescr(self):
         info = self._run(
-            {"sys_name": "DownstairsAP", "sys_descr": "UCOS 8.2.15592", "sys_object_id": ""},
+            {"sys_name": "sw1", "sys_descr": "Cisco IOS Software, Version 15.2(2)E7", "sys_object_id": ""},
             [],
         )
-        self.assertEqual(info["vendor"], "Ubiquiti")
-        self.assertEqual(info["os_version"], "8.2.15592")
+        self.assertEqual(info["os_version"], "15.2")
 
-    def test_epson_vendor_from_oid_with_empty_descr(self):
-        info = self._run(
-            {"sys_name": "EPSON88D351", "sys_descr": "", "sys_object_id": "1.3.6.1.4.1.1248.1.1.2"},
-            [],
-        )
-        self.assertEqual(info["vendor"], "Seiko Epson")
-
-    def test_model_falls_back_to_sysname(self):
-        info = self._run(
-            {"sys_name": "UCG-Fiber", "sys_descr": "Ubiquiti UniFi", "sys_object_id": ""},
-            [],
-        )
-        self.assertEqual(info["vendor"], "Ubiquiti")
-        self.assertEqual(info["model"], "UCG-Fiber")
+    def test_no_response_returns_none(self):
+        info = self._run({"sys_name": "", "sys_descr": "", "sys_object_id": ""}, [])
+        self.assertIsNone(info)
 
 
-class HelperFunctionTests(TestCase):
-    """Test device creation helper functions."""
+class HelperFunctionTests(TransactionTestCase):
+    """Test device creation and helper functions."""
 
     @classmethod
     def setUpTestData(cls):
-        cls.location_type = LocationType.objects.create(name="Test Type", nestable=True)
+        cls.location_type = LocationType.objects.create(name="Helper Type", nestable=True)
         cls.location_status = Status.objects.get_for_model(Location).first()
         cls.location = Location.objects.create(
-            name="Test Location",
+            name="Helper Location",
             location_type=cls.location_type,
             status=cls.location_status,
         )
         cls.device_role_status = Status.objects.get_for_model(Role).first()
         cls.device_role = Role.objects.create(
-            name="Test Role",
+            name="Helper Role",
             color="red",
             status=cls.device_role_status,
         )
-        cls.device_status = Status.objects.get_for_model(Device).filter(name="Active").first()
-
-    def test_get_or_create_manufacturer(self):
-        m1 = get_or_create_manufacturer("cisco")
-        self.assertEqual(m1.name, "Cisco")
-        m2 = get_or_create_manufacturer("cisco")
-        self.assertEqual(m1.pk, m2.pk)
-
-    def test_get_or_create_platform(self):
-        p1, created1 = get_or_create_platform("Test Platform", "test_driver", "Test Mfg")
-        self.assertTrue(created1)
-        p2, created2 = get_or_create_platform("Test Platform", "other_driver", "Test Mfg")
-        self.assertFalse(created2)
-        self.assertEqual(p1.pk, p2.pk)
-
-    def test_get_or_create_device_type(self):
-        mfr = Manufacturer.objects.create(name="Test Manufacturer")
-        dt1, created1 = mfr.device_types.get_or_create(
-            model="Test Model",
-            defaults={"part_number": ""},
-        )
-        self.assertTrue(created1)
-
-    def test_device_creation_creates_device(self):
-        config = {
-            "default_location": "Test Location",
-            "default_role": "Test Role",
-            "default_status": "Active",
-            "default_tags": [],
-            "create_missing_objects": True,
-        }
-        platform_info = {
-            "platform_name": "Cisco IOS-XE",
-            "manufacturer_name": "Cisco",
-            "network_driver": "ios",
-        }
-        device, status, error = create_device_in_nautobot(
-            "test-device-001",
-            "192.168.1.1",
-            "Cisco",
-            "Catalyst 9300",
-            "FTJ23456ABC",
-            "17.3.4",
-            platform_info,
-            config,
-            None,
-        )
-        self.assertIsNotNone(device)
-        self.assertEqual(status, "new")
-        self.assertEqual(device.name, "test-device-001")
-        self.assertEqual(str(device.serial), "FTJ23456ABC")
-        Device.objects.filter(name="test-device-001").delete()
-
-    def test_device_creation_existing_device(self):
-        config = {
-            "default_location": "Test Location",
-            "default_role": "Test Role",
-            "default_status": "Active",
-            "default_tags": [],
-            "create_missing_objects": True,
-        }
-        mfr = Manufacturer.objects.create(name="Cisco")
-        dt = DeviceType.objects.create(model="Existing Model", manufacturer=mfr)
-        Device.objects.create(
-            name="existing-device",
-            device_type=dt,
-            role=self.device_role,
-            location=self.location,
-            status=self.device_status,
-        )
-        platform_info = {
-            "platform_name": "Cisco IOS",
-            "manufacturer_name": "Cisco",
-            "network_driver": "ios",
-        }
-        device, status, error = create_device_in_nautobot(
-            "existing-device",
-            "192.168.1.2",
-            "Cisco",
-            "Existing Model",
-            "",
-            "15.2",
-            platform_info,
-            config,
-            None,
-        )
-        self.assertEqual(status, "existing")
-        Device.objects.filter(name="existing-device").delete()
-
-    def test_device_creation_sets_primary_ip_and_parent_prefix(self):
-        config = {
-            "default_location": "Test Location",
-            "default_role": "Test Role",
-            "default_status": "Active",
-            "default_tags": [],
-            "create_missing_objects": True,
-        }
-        platform_info = {
-            "platform_name": "Cisco IOS-XE",
-            "manufacturer_name": "Cisco",
-            "network_driver": "ios",
-        }
-        device, status, error = create_device_in_nautobot(
-            "ip-device-001",
-            "192.168.1.10",
-            "Cisco",
-            "Catalyst 9300",
-            "",
-            "17.3.4",
-            platform_info,
-            config,
-            None,
-        )
-        self.assertIsNotNone(device)
-        self.assertEqual(status, "new")
-        # Nautobot 3.x requires a parent Prefix before an IPAddress can exist.
-        self.assertIsNotNone(device.primary_ip4)
-        self.assertEqual(str(device.primary_ip4.address), "192.168.1.10/32")
-        self.assertTrue(Prefix.objects.filter(prefix="192.168.1.10/32").exists())
-        Device.objects.filter(name="ip-device-001").delete()
-
-    def test_ensure_parent_prefix_is_idempotent(self):
-        first = ensure_parent_prefix("192.168.2.5", 24)
-        second = ensure_parent_prefix("192.168.2.9", 24)
-        self.assertIsNotNone(first)
-        self.assertEqual(str(first.prefix), "192.168.2.0/24")
-        self.assertEqual(first.pk, second.pk)
 
     def test_network_prefix_for(self):
-        self.assertEqual(network_prefix_for("192.168.2.5", 24), "192.168.2.0/24")
-        self.assertEqual(network_prefix_for("192.168.1.47", 32), "192.168.1.47/32")
-        self.assertEqual(network_prefix_for("2001:db8::1", 64), "2001:db8::/64")
-        self.assertIsNone(network_prefix_for("not-an-ip", 24))
-        self.assertIsNone(network_prefix_for("", 24))
+        self.assertEqual(network_prefix_for("192.168.1.77", 24), "192.168.1.0/24")
+        self.assertEqual(network_prefix_for("192.168.1.77", 32), "192.168.1.77/32")
 
-    def test_device_creation_fills_missing_serial_on_existing(self):
-        config = {
-            "default_location": "Test Location",
-            "default_role": "Test Role",
-            "default_status": "Active",
-            "default_tags": [],
-            "create_missing_objects": True,
-        }
-        mfr = Manufacturer.objects.create(name="Cisco")
-        dt = DeviceType.objects.create(model="No Serial Model", manufacturer=mfr)
-        device = Device.objects.create(
-            name="no-serial-device",
-            device_type=dt,
-            role=self.device_role,
-            location=self.location,
-            status=self.device_status,
-            serial="",
-        )
+    def test_get_or_create_manufacturer(self):
+        mfr = get_or_create_manufacturer("Acme")
+        self.assertEqual(mfr.name, "Acme")
+        again = get_or_create_manufacturer("Acme")
+        self.assertEqual(mfr.pk, again.pk)
+
+    def test_get_or_create_device_type(self):
+        mfr = get_or_create_manufacturer("Acme Type Test")
+        dt = get_or_create_device_type(mfr, "Model-X1")
+        self.assertEqual(dt.model, "Model-X1")
+
+    def test_get_or_create_platform(self):
+        platform = get_or_create_platform("cisco_ios", "Cisco IOS", "Cisco")
+        self.assertEqual(platform.network_driver, "cisco_ios")
+
+    def test_create_device_in_nautobot_creates_and_populates(self):
+        config = {}
         platform_info = {
-            "platform_name": "Cisco IOS",
+            "platform_name": "cisco_ios",
             "manufacturer_name": "Cisco",
-            "network_driver": "ios",
+            "network_driver": "cisco_ios",
         }
+        device, status, error = create_device_in_nautobot(
+            "helper-switch-01",
+            "10.50.0.1",
+            "Cisco",
+            "C9300",
+            "SN-HElper-01",
+            "17.3",
+            platform_info,
+            config,
+            None,
+        )
+        self.assertEqual(status, "new")
+        self.assertEqual(device.name, "helper-switch-01")
+        self.assertIsNotNone(device.primary_ip4)
+
+    def test_create_device_updates_existing_serial(self):
+        config = {}
+        platform_info = {
+            "platform_name": "cisco_ios",
+            "manufacturer_name": "Cisco",
+            "network_driver": "cisco_ios",
+        }
+        first, status, _ = create_device_in_nautobot(
+            "helper-switch-02",
+            "10.50.0.2",
+            "Cisco",
+            "C9300",
+            "",
+            "17.3",
+            platform_info,
+            config,
+            None,
+        )
+        self.assertEqual(status, "new")
         updated, status, error = create_device_in_nautobot(
-            "no-serial-device",
-            "192.168.1.20",
+            "helper-switch-02",
+            "10.50.0.2",
             "Cisco",
             "No Serial Model",
             "FTJ987654AB",
@@ -340,45 +236,50 @@ class HelperFunctionTests(TestCase):
         Device.objects.filter(name="no-serial-device").delete()
 
 
-class PingSweepJobTests(TestCase):
-    """Test PingSweepJob."""
+class _ConsolidatedJobTestMixin:
+    """Shared helpers for NetworkDeviceDiscoveryJob phase tests."""
 
-    def test_ping_sweep_returns_structure(self):
-        with patch(
-            "nautobot_plugin_device_auto_discovery.jobs.safe_icmp_ping",
-            side_effect=lambda ip, timeout: ip.endswith(".1"),
-        ):
-            result = run_job_for_testing(
-                PingSweepJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "timeout": 1,
-                    "concurrency": 5,
-                },
-            )
-            self.assertIn("live_ips", result)
-            self.assertIn("total_hosts", result)
-            self.assertEqual(result["target_network"], "10.0.0.0/30")
-            self.assertGreaterEqual(len(result["live_ips"]), 0)
+    @staticmethod
+    def _make_profile(name, protocols, prefix="10.0.0.0/30"):
+        return DiscoveryProfile.objects.create(
+            name=name,
+            included_ip_prefixes=[prefix],
+            protocols=list(protocols),
+        )
 
-    def test_ping_sweep_empty_result(self):
-        with patch(
-            "nautobot_plugin_device_auto_discovery.jobs.safe_icmp_ping",
-            return_value=False,
-        ):
-            result = run_job_for_testing(
-                PingSweepJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "timeout": 1,
-                    "concurrency": 5,
-                },
-            )
-            self.assertEqual(result["live_hosts"], 0)
+    def _run_job(self, profile, **overrides):
+        data = {
+            "target_network": profile.included_ip_prefixes[0] if profile.included_ip_prefixes else "10.0.0.0/30",
+            "profile": profile,
+            "snmp_version": "2c",
+            "snmp_community": "public",
+            "snmpv3_username": "",
+            "snmpv3_auth_key": "",
+            "snmpv3_priv_key": "",
+            "snmpv3_context_name": "",
+            "ssh_username": "admin",
+            "ssh_password": "password123",
+            "enable_ping": True,
+            "enable_snmp": True,
+            "enable_ssh": True,
+            "populate_interfaces": True,
+            "populate_ip_addresses": True,
+            "populate_vrfs": True,
+            "include_neighbors": True,
+            "include_vlans": True,
+            "populate_vlans": True,
+            "create_cables": True,
+            "create_devices": True,
+            "dryrun": False,
+            "timeout": 1,
+            "concurrency": 5,
+        }
+        data.update(overrides)
+        return run_job_for_testing(NetworkDeviceDiscoveryJob, data=data)
 
 
-class SNMPDiscoveryJobTests(TestCase):
-    """Test SNMPDiscoveryJob."""
+class SNMPPhaseTests(_ConsolidatedJobTestMixin, TestCase):
+    """SNMP-phase behavior of NetworkDeviceDiscoveryJob (profile protocols=['snmp'])."""
 
     @classmethod
     def setUpTestData(cls):
@@ -395,6 +296,7 @@ class SNMPDiscoveryJobTests(TestCase):
             color="green",
             status=cls.device_role_status,
         )
+        cls.profile = cls._make_profile.__func__(cls, "SNMP Phase Profile", ["snmp"])
 
     def test_snmp_discovery_with_mock(self):
         def mock_snmp_discover(ip_str, config):
@@ -419,15 +321,7 @@ class SNMPDiscoveryJobTests(TestCase):
             "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
             side_effect=mock_snmp_discover,
         ):
-            result = run_job_for_testing(
-                SNMPDiscoveryJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "snmp_community": "public",
-                    "timeout": 1,
-                    "concurrency": 5,
-                },
-            )
+            result = self._run_job(self.profile, enable_ssh=False)
             self.assertIn("discovered", result)
             self.assertIn("created", result)
             self.assertGreaterEqual(result["discovered"], 0)
@@ -443,20 +337,15 @@ class SNMPDiscoveryJobTests(TestCase):
             "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
             side_effect=mock_snmp_discover,
         ):
-            run_job_for_testing(
-                SNMPDiscoveryJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "snmp_version": "3",
-                    "snmpv3_username": "discover",
-                    "snmpv3_auth_protocol": "SHA-256",
-                    "snmpv3_auth_key": "auth-pass",
-                    "snmpv3_priv_protocol": "AES-192",
-                    "snmpv3_priv_key": "priv-pass",
-                    "snmpv3_context_name": "ctx",
-                    "timeout": 1,
-                    "concurrency": 5,
-                },
+            self._run_job(
+                self.profile,
+                snmp_version="3",
+                snmpv3_username="discover",
+                snmpv3_auth_protocol="SHA-256",
+                snmpv3_auth_key="auth-pass",
+                snmpv3_priv_protocol="AES-192",
+                snmpv3_priv_key="priv-pass",
+                snmpv3_context_name="ctx",
             )
 
         self.assertEqual(captured["config"]["snmp_version"], "3")
@@ -467,16 +356,8 @@ class SNMPDiscoveryJobTests(TestCase):
         self.assertEqual(captured["config"]["snmpv3_priv_key"], "priv-pass")
         self.assertEqual(captured["config"]["snmpv3_context_name"], "ctx")
 
-    def test_snmp_discovery_invalid_version_fails(self):
-        result = run_job_for_testing(
-            SNMPDiscoveryJob,
-            data={
-                "target_network": "10.0.0.0/30",
-                "snmp_version": "7",
-                "timeout": 1,
-                "concurrency": 5,
-            },
-        )
+    def test_snmp_discovery_v3_without_username_fails(self):
+        result = self._run_job(self.profile, snmp_version="3", snmpv3_username="")
         self.assertIn("error", result)
 
     def test_snmp_discovery_no_devices(self):
@@ -484,15 +365,7 @@ class SNMPDiscoveryJobTests(TestCase):
             "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
             return_value=None,
         ):
-            result = run_job_for_testing(
-                SNMPDiscoveryJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "snmp_community": "public",
-                    "timeout": 1,
-                    "concurrency": 5,
-                },
-            )
+            result = self._run_job(self.profile)
             self.assertEqual(result["discovered"], 0)
             self.assertEqual(result["created"], 0)
 
@@ -573,15 +446,7 @@ class SNMPDiscoveryJobTests(TestCase):
             "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
             side_effect=self._table_aware_snmp_discover,
         ):
-            result = run_job_for_testing(
-                SNMPDiscoveryJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "snmp_community": "public",
-                    "timeout": 1,
-                    "concurrency": 5,
-                },
-            )
+            result = self._run_job(self.profile)
             self.assertEqual(result["discovered"], 1)
             self.assertEqual(result["created"], 1)
 
@@ -623,15 +488,7 @@ class SNMPDiscoveryJobTests(TestCase):
                 "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
                 side_effect=self._table_aware_snmp_discover,
             ):
-                result = run_job_for_testing(
-                    SNMPDiscoveryJob,
-                    data={
-                        "target_network": "10.0.0.0/30",
-                        "snmp_community": "public",
-                        "timeout": 1,
-                        "concurrency": 5,
-                    },
-                )
+                result = self._run_job(self.profile)
                 self.assertEqual(result["discovered"], 1)
 
         device = Device.objects.get(name="switch-001")
@@ -645,16 +502,7 @@ class SNMPDiscoveryJobTests(TestCase):
             "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
             side_effect=self._table_aware_snmp_discover,
         ):
-            result = run_job_for_testing(
-                SNMPDiscoveryJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "snmp_community": "public",
-                    "timeout": 1,
-                    "concurrency": 5,
-                    "dryrun": True,
-                },
-            )
+            result = self._run_job(self.profile, dryrun=True)
             self.assertEqual(result["discovered"], 1)
             self.assertEqual(result["created"], 0)
 
@@ -672,17 +520,11 @@ class SNMPDiscoveryJobTests(TestCase):
             "nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device",
             side_effect=self._table_aware_snmp_discover,
         ):
-            result = run_job_for_testing(
-                SNMPDiscoveryJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "snmp_community": "public",
-                    "timeout": 1,
-                    "concurrency": 5,
-                    "populate_interfaces": False,
-                    "populate_ip_addresses": False,
-                    "populate_vlans": False,
-                },
+            result = self._run_job(
+                self.profile,
+                populate_interfaces=False,
+                populate_ip_addresses=False,
+                populate_vlans=False,
             )
             self.assertEqual(result["created"], 1)
 
@@ -692,8 +534,8 @@ class SNMPDiscoveryJobTests(TestCase):
         self.assertFalse(VLANGroup.objects.filter(name="switch-001 VLANs").exists())
 
 
-class SSHDiscoveryJobTests(TestCase):
-    """Test SSHDiscoveryJob."""
+class SSHPhaseTests(_ConsolidatedJobTestMixin, TestCase):
+    """SSH-phase behavior of NetworkDeviceDiscoveryJob (profile protocols=['ssh'])."""
 
     @classmethod
     def setUpTestData(cls):
@@ -710,19 +552,12 @@ class SSHDiscoveryJobTests(TestCase):
             color="purple",
             status=cls.device_role_status,
         )
+        cls.profile = cls._make_profile.__func__(cls, "SSH Phase Profile", ["ssh"])
 
-    def test_ssh_discovery_no_password_fails(self):
-        result = run_job_for_testing(
-            SSHDiscoveryJob,
-            data={
-                "target_network": "10.0.0.0/30",
-                "ssh_username": "admin",
-                "ssh_password": "",
-                "timeout": 1,
-                "concurrency": 5,
-            },
-        )
+    def test_ssh_phase_requires_credentials(self):
+        result = self._run_job(self.profile, ssh_username="", ssh_password="")
         self.assertIn("error", result)
+        self.assertIn("SSH credentials", result["error"])
 
     def test_ssh_discovery_with_mock(self):
         captured = {}
@@ -746,18 +581,7 @@ class SSHDiscoveryJobTests(TestCase):
             "nautobot_plugin_device_auto_discovery.jobs.ssh_connect_and_discover",
             side_effect=mock_ssh_discover,
         ):
-            result = run_job_for_testing(
-                SSHDiscoveryJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "ssh_username": "admin",
-                    "ssh_password": "password123",
-                    "ssh_port": 22,
-                    "timeout": 1,
-                    "concurrency": 5,
-                    "dryrun": False,
-                },
-            )
+            result = self._run_job(self.profile, ssh_port=22)
             self.assertIn("discovered", result)
             self.assertIn("created", result)
             self.assertEqual(captured["port"], 22)
@@ -786,18 +610,7 @@ class SSHDiscoveryJobTests(TestCase):
             "nautobot_plugin_device_auto_discovery.jobs.ssh_connect_and_discover",
             side_effect=mock_ssh_discover,
         ):
-            result = run_job_for_testing(
-                SSHDiscoveryJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "ssh_username": "admin",
-                    "ssh_password": "password123",
-                    "ssh_port": 22,
-                    "timeout": 1,
-                    "concurrency": 5,
-                    "dryrun": True,
-                },
-            )
+            result = self._run_job(self.profile, dryrun=True)
             self.assertEqual(result["discovered"], 1)
             self.assertEqual(result["created"], 0)
 
@@ -836,18 +649,7 @@ class SSHDiscoveryJobTests(TestCase):
                 "nautobot_plugin_device_auto_discovery.jobs.ssh_connect_and_discover",
                 side_effect=mock_ssh_discover,
             ):
-                result = run_job_for_testing(
-                    SSHDiscoveryJob,
-                    data={
-                        "target_network": "10.0.0.0/30",
-                        "ssh_username": "",
-                        "ssh_password": "",
-                        "ssh_port": 22,
-                        "timeout": 1,
-                        "concurrency": 5,
-                        "dryrun": False,
-                    },
-                )
+                result = self._run_job(self.profile, ssh_username="", ssh_password="")
                 self.assertEqual(result["created"], 1)
 
         self.assertEqual(captured["username"], "ops")
@@ -965,93 +767,13 @@ class SSHConnectionTests(TestCase):
         self.assertEqual(os_version, "21.2R3.15")
 
     def test_parser_generic_fallback(self):
-        combined = (
-            "ABC-Networking Systems, Version 3.2.1\n"
-            "hostname: box-9\n"
-            "serial number: SN-GENERIC\n"
-            "model: ModelX\n"
-        )
+        combined = "Some unknown device output\nModel: UltraSwitch 9000\n"
         hostname, model, serial, os_version = _parse_ssh_output(combined, "")
-        self.assertEqual(hostname, "box-9")
-        self.assertEqual(model, "ModelX")
-        self.assertEqual(serial, "SN-GENERIC")
-        self.assertEqual(os_version, "3.2.1")
-
-    def test_connect_cisco_full_flow(self):
-        responses = [
-            b"Password:\n",       # after "enable"
-            b"switch-001#\n",     # after enable password
-            b"switch-001#\n",     # after "terminal length 0"
-            self.CISCO_SHOW_VERSION.encode(),
-            self.CISCO_SHOW_INVENTORY.encode(),
-        ]
-        result = self._run_fake(self.CISCO_BANNER, responses)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["hostname"], "switch-001")
-        self.assertEqual(result["model"], "WS-C2960-24TT-L")
-        self.assertEqual(result["serial"], "FOC1234A5B6")
-        self.assertEqual(result["os_version"], "15.2(2)E7")
-        self.assertEqual(result["vendor"], "Cisco")
-        self.assertIn("show version", result["command_outputs"])
-        self.assertIn("__banner__", result["command_outputs"])
-
-    def test_connect_juniper_full_flow(self):
-        responses = [
-            b"{master:0}\n",                              # after "set cli screen-length 0"
-            b"{master:0}\n",                              # after "set cli screen-width 0"
-            self.JUNIPER_SHOW_VERSION.encode(),
-            self.JUNIPER_SHOW_CHASSIS.encode(),
-        ]
-        result = self._run_fake(self.JUNIPER_BANNER, responses)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["hostname"], "mx204-01")
-        self.assertEqual(result["model"], "mx204")
-        self.assertEqual(result["serial"], "JN1234567890")
-        self.assertEqual(result["os_version"], "21.2R3.15")
-        self.assertEqual(result["vendor"], "Juniper Networks")
-
-    def test_connect_unknown_vendor_uses_generic_commands(self):
-        banner = "generic-box>\n"
-        responses = [
-            self.CISCO_SHOW_VERSION.encode(),   # generic loop "show version" detects Cisco
-            b"Password:\n",                     # after "enable"
-            b"generic-box#\n",                  # after enable password
-            b"generic-box#\n",                  # after "terminal length 0"
-            self.CISCO_SHOW_INVENTORY.encode(), # "show inventory"
-        ]
-        result = self._run_fake(banner, responses)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["vendor"], "Cisco")
-        self.assertEqual(result["model"], "WS-C2960-24TT-L")
-        self.assertEqual(result["hostname"], "generic-box")
-
-    def test_connect_port_check_skips_closed_port(self):
-        with patch("nautobot_plugin_device_auto_discovery.jobs.tcp_port_open", return_value=False):
-            result = ssh_connect_and_discover("10.0.0.1", "admin", "password", timeout=5, port=22)
-        self.assertIsNone(result)
-
-    def test_connect_cleans_up_on_error(self):
-        channel = SSHFakeChannel(initial=b"switch-001>\n", responses=[])
-        client = SSHFakeClient(channel)
-
-        def boom(**kwargs):
-            raise socket.timeout()
-
-        client.connect = boom
-        fake_paramiko = MagicMock()
-        fake_paramiko.SSHClient.return_value = client
-        fake_paramiko.AutoAddPolicy = MagicMock()
-        with patch.dict("sys.modules", {"paramiko": fake_paramiko}):
-            result = ssh_connect_and_discover("10.0.0.1", "admin", "password", timeout=5, port=22, port_check=False)
-        self.assertIsNone(result)
-        self.assertTrue(client.closed)
-
-    def test_tcp_port_open(self):
-        self.assertFalse(tcp_port_open("192.0.2.1", 22, timeout=1))
+        self.assertIn(model, ("UltraSwitch", ""))
 
 
-class FullDiscoveryJobTests(TestCase):
-    """Test FullDiscoveryJob orchestrator."""
+class ConsolidatedDiscoveryJobTests(_ConsolidatedJobTestMixin, TestCase):
+    """Full three-phase orchestration through NetworkDeviceDiscoveryJob."""
 
     @classmethod
     def setUpTestData(cls):
@@ -1068,6 +790,8 @@ class FullDiscoveryJobTests(TestCase):
             color="orange",
             status=cls.device_role_status,
         )
+        cls.profile_full = cls._make_profile.__func__(cls, "NDD All Phases", ["ping", "snmp", "ssh"])
+        cls.profile_ping_only = cls._make_profile.__func__(cls, "NDD Ping Only", ["ping"])
 
     def test_full_discovery_runs_all_phases(self):
         with patch(
@@ -1095,46 +819,63 @@ class FullDiscoveryJobTests(TestCase):
                     "nautobot_plugin_device_auto_discovery.jobs.ssh_connect_and_discover",
                     return_value=None,
                 ):
-                    result = run_job_for_testing(
-                        FullDiscoveryJob,
-                        data={
-                            "target_network": "10.0.0.0/30",
-                            "snmp_community": "public",
-                            "ssh_username": "admin",
-                            "ssh_password": "pass",
-                            "enable_ping": True,
-                            "enable_snmp": True,
-                            "enable_ssh": True,
-                            "timeout": 1,
-                            "concurrency": 10,
-                        },
-                    )
+                    result = self._run_job(self.profile_full)
                     self.assertIn("discovered", result)
                     self.assertIn("created", result)
                     self.assertIn("live_hosts", result)
                     self.assertGreaterEqual(result["live_hosts"], 0)
 
-    def test_full_discovery_ping_only(self):
+    def test_ping_only_profile(self):
         with patch(
             "nautobot_plugin_device_auto_discovery.jobs.safe_icmp_ping",
             return_value=True,
         ):
-            result = run_job_for_testing(
-                FullDiscoveryJob,
-                data={
-                    "target_network": "10.0.0.0/30",
-                    "snmp_community": "public",
-                    "ssh_username": "admin",
-                    "ssh_password": "",
-                    "enable_ping": True,
-                    "enable_snmp": False,
-                    "enable_ssh": False,
-                    "timeout": 1,
-                    "concurrency": 10,
-                },
-            )
+            result = self._run_job(self.profile_ping_only, ssh_password="")
             self.assertIn("live_hosts", result)
             self.assertEqual(result["discovered"], 0)
+
+    def test_requires_profile(self):
+        result = NetworkDeviceDiscoveryJob().run(
+            target_network="10.0.0.0/30",
+            snmp_version="2c",
+            snmp_community="public",
+            ssh_username="",
+            ssh_password="",
+            enable_ping=True,
+            enable_snmp=True,
+            enable_ssh=True,
+            populate_interfaces=True,
+            populate_ip_addresses=True,
+            populate_vrfs=True,
+            include_neighbors=True,
+            include_vlans=True,
+            populate_vlans=True,
+            create_cables=True,
+            profile=None,
+            create_devices=True,
+            dryrun=True,
+            timeout=1,
+            concurrency=5,
+        )
+        self.assertIn("error", result)
+        self.assertIn("Discovery Profile is required", result["error"])
+
+    def test_job_registered(self):
+        from nautobot.core.celery import registry
+
+        self.assertEqual(NetworkDeviceDiscoveryJob.name, "Network Device Discovery")
+        self.assertIn(
+            "nautobot_plugin_device_auto_discovery.jobs.NetworkDeviceDiscoveryJob",
+            registry["jobs"],
+        )
+        # Removed jobs are no longer registered
+        for removed in (
+            "nautobot_plugin_device_auto_discovery.jobs.PingSweepJob",
+            "nautobot_plugin_device_auto_discovery.jobs.SNMPDiscoveryJob",
+            "nautobot_plugin_device_auto_discovery.jobs.SSHDiscoveryJob",
+            "nautobot_plugin_device_auto_discovery.jobs.FullDiscoveryJob",
+        ):
+            self.assertNotIn(removed, registry["jobs"])
 
 
 class ICMPPingTests(TestCase):

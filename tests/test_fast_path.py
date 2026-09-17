@@ -146,7 +146,7 @@ class FastPathFailureTests(TestCase):
 
 
 class FastPathJobIntegrationTests(TestCase):
-    """Integration: FullDiscoveryJob honors the profile fast_path flag."""
+    """Integration: NetworkDeviceDiscoveryJob honors the profile fast_path flag."""
 
     @classmethod
     def setUpTestData(cls):
@@ -204,7 +204,7 @@ class FastPathJobIntegrationTests(TestCase):
     def test_fast_path_success_uses_stored_group(self):
         from nautobot.extras.test_tools import run_job_for_testing
 
-        from nautobot_plugin_device_auto_discovery.jobs import FullDiscoveryJob
+        from nautobot_plugin_device_auto_discovery.jobs import NetworkDeviceDiscoveryJob
 
         ip_str = "10.7.2.1"
         self._prep_device(ip_str)
@@ -226,7 +226,7 @@ class FastPathJobIntegrationTests(TestCase):
                 "nautobot_plugin_device_auto_discovery.jobs.ssh_connect_and_discover", side_effect=mock_ssh
             ):
                 result = run_job_for_testing(
-                    FullDiscoveryJob,
+                    NetworkDeviceDiscoveryJob,
                     data={
                         "target_network": "10.7.2.0/30",
                         "profile": self.profile,
@@ -249,7 +249,7 @@ class FastPathJobIntegrationTests(TestCase):
     def test_fast_path_failure_falls_back_and_self_corrects(self):
         from nautobot.extras.test_tools import run_job_for_testing
 
-        from nautobot_plugin_device_auto_discovery.jobs import FullDiscoveryJob
+        from nautobot_plugin_device_auto_discovery.jobs import NetworkDeviceDiscoveryJob
 
         ip_str = "10.7.2.1"
         self._prep_device(ip_str)
@@ -274,7 +274,7 @@ class FastPathJobIntegrationTests(TestCase):
                 "nautobot_plugin_device_auto_discovery.jobs.ssh_connect_and_discover", side_effect=mock_ssh
             ):
                 result = run_job_for_testing(
-                    FullDiscoveryJob,
+                    NetworkDeviceDiscoveryJob,
                     data={
                         "target_network": "10.7.2.0/30",
                         "profile": self.profile,
@@ -300,7 +300,7 @@ class FastPathJobIntegrationTests(TestCase):
     def test_fast_path_disabled_full_discovery(self):
         from nautobot.extras.test_tools import run_job_for_testing
 
-        from nautobot_plugin_device_auto_discovery.jobs import FullDiscoveryJob
+        from nautobot_plugin_device_auto_discovery.jobs import NetworkDeviceDiscoveryJob
 
         profile = DiscoveryProfile.objects.create(
             name="No Fast Path Profile",
@@ -332,7 +332,7 @@ class FastPathJobIntegrationTests(TestCase):
                 "nautobot_plugin_device_auto_discovery.jobs.ssh_connect_and_discover", side_effect=mock_ssh
             ):
                 result = run_job_for_testing(
-                    FullDiscoveryJob,
+                    NetworkDeviceDiscoveryJob,
                     data={
                         "target_network": "10.7.3.0/30",
                         "profile": profile,

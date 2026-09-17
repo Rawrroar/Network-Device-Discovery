@@ -279,7 +279,7 @@ class RecordSSHSuccessTests(TestCase):
 
 
 class SSHJobSecretsIntegrationTests(TestCase):
-    """Integration: SSHDiscoveryJob uses profile secrets groups with retry."""
+    """Integration: NetworkDeviceDiscoveryJob (ssh phase) uses profile secrets groups with retry."""
 
     @classmethod
     def setUpTestData(cls):
@@ -307,7 +307,7 @@ class SSHJobSecretsIntegrationTests(TestCase):
     def test_job_uses_secrets_group_credentials(self):
         from nautobot.extras.test_tools import run_job_for_testing
 
-        from nautobot_plugin_device_auto_discovery.jobs import SSHDiscoveryJob
+        from nautobot_plugin_device_auto_discovery.jobs import NetworkDeviceDiscoveryJob
 
         captured = {}
 
@@ -329,12 +329,17 @@ class SSHJobSecretsIntegrationTests(TestCase):
             side_effect=mock_ssh_discover,
         ):
             result = run_job_for_testing(
-                SSHDiscoveryJob,
+                NetworkDeviceDiscoveryJob,
                 data={
                     "target_network": "10.0.0.0/30",
                     "ssh_username": "",
                     "ssh_password": "",
                     "profile": self.profile,
+                    "snmp_version": "2c",
+                    "snmp_community": "public",
+                    "enable_ping": False,
+                    "enable_snmp": False,
+                    "enable_ssh": True,
                     "timeout": 1,
                     "concurrency": 5,
                     "dryrun": False,

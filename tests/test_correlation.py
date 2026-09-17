@@ -9,7 +9,7 @@ from nautobot.extras.test_tools import run_job_for_testing
 from nautobot.ipam.models import IPAddress
 
 from nautobot_plugin_device_auto_discovery.correlation import correlate_device
-from nautobot_plugin_device_auto_discovery.jobs import SNMPDiscoveryJob, ensure_parent_prefix
+from nautobot_plugin_device_auto_discovery.jobs import NetworkDeviceDiscoveryJob, ensure_parent_prefix
 from nautobot_plugin_device_auto_discovery.models import DiscoveredDevice, DiscoveryProfile, DiscoveryResult
 from nautobot_plugin_device_auto_discovery.utils import strip_domain_suffixes
 
@@ -213,10 +213,17 @@ class ProfileDiscoveryTests(TestCase):
             side_effect=mock_discover,
         ):
             result = run_job_for_testing(
-                SNMPDiscoveryJob,
+                NetworkDeviceDiscoveryJob,
                 data={
                     "target_network": "10.255.255.0/30",
                     "profile": profile,
+                    "snmp_version": "2c",
+                    "snmp_community": "public",
+                    "ssh_username": "",
+                    "ssh_password": "",
+                    "enable_ping": True,
+                    "enable_snmp": True,
+                    "enable_ssh": True,
                     "timeout": 1,
                     "concurrency": 5,
                 },
@@ -250,19 +257,33 @@ class ProfileDiscoveryTests(TestCase):
             side_effect=self._table_aware_snmp_discover,
         ):
             first = run_job_for_testing(
-                SNMPDiscoveryJob,
+                NetworkDeviceDiscoveryJob,
                 data={
                     "target_network": "10.0.0.0/30",
                     "profile": profile,
+                    "snmp_version": "2c",
+                    "snmp_community": "public",
+                    "ssh_username": "",
+                    "ssh_password": "",
+                    "enable_ping": True,
+                    "enable_snmp": True,
+                    "enable_ssh": True,
                     "timeout": 1,
                     "concurrency": 5,
                 },
             )
             second = run_job_for_testing(
-                SNMPDiscoveryJob,
+                NetworkDeviceDiscoveryJob,
                 data={
                     "target_network": "10.0.0.0/30",
                     "profile": profile,
+                    "snmp_version": "2c",
+                    "snmp_community": "public",
+                    "ssh_username": "",
+                    "ssh_password": "",
+                    "enable_ping": True,
+                    "enable_snmp": True,
+                    "enable_ssh": True,
                     "timeout": 1,
                     "concurrency": 5,
                 },
@@ -286,10 +307,17 @@ class ProfileDiscoveryTests(TestCase):
             side_effect=self._table_aware_snmp_discover,
         ):
             result = run_job_for_testing(
-                SNMPDiscoveryJob,
+                NetworkDeviceDiscoveryJob,
                 data={
                     "target_network": "10.0.0.0/30",
                     "profile": profile,
+                    "snmp_version": "2c",
+                    "snmp_community": "public",
+                    "ssh_username": "",
+                    "ssh_password": "",
+                    "enable_ping": True,
+                    "enable_snmp": True,
+                    "enable_ssh": True,
                     "create_devices": False,
                     "timeout": 1,
                     "concurrency": 5,
@@ -314,10 +342,17 @@ class ProfileDiscoveryTests(TestCase):
             maximum_ip_addresses=1,
         )
         result = run_job_for_testing(
-            SNMPDiscoveryJob,
+            NetworkDeviceDiscoveryJob,
             data={
                 "target_network": "10.0.0.0/30",
                 "profile": profile,
+                "snmp_version": "2c",
+                "snmp_community": "public",
+                "ssh_username": "",
+                "ssh_password": "",
+                "enable_ping": True,
+                "enable_snmp": True,
+                "enable_ssh": True,
                 "timeout": 1,
                 "concurrency": 5,
             },

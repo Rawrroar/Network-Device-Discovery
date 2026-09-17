@@ -79,6 +79,7 @@ class DiscoveryScanFilterForm(NautobotFilterForm):
             ("full", "Full"),
             ("crawl", "Crawl"),
             ("vrf", "VRF"),
+            ("sync", "Sync"),
         ],
         required=False,
         label="Method",

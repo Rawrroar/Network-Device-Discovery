@@ -4,13 +4,7 @@ A [Nautobot](https://nautobot.com/) App for automatic network device discovery v
 
 ## Overview
 
-This plugin discovers network devices on your IP ranges and automatically creates them in Nautobot. It supports three discovery methods:
-
-- **ICMP Ping Sweep** — find live hosts in a CIDR range
-- **SNMP Discovery** — query live hosts for hostname, model, vendor, platform, and VLANs via SNMP
-- **SSH Discovery** — connect via SSH, run show commands, and parse output for device identification
-
-The **Full Discovery** job orchestrates all three methods in sequence: ping first, then SNMP on live hosts, then SSH on any remaining hosts.
+This plugin discovers network devices on your IP ranges and maintains accurate inventory in Nautobot. Discovery is driven by a **Discovery Profile** that defines scan scope, protocols (`ping` / `snmp` / `ssh`), and credentials; the consolidated **Network Device Discovery** job executes the phases and correlates the results against your inventory.
 
 ## Features
 
@@ -18,7 +12,7 @@ The **Full Discovery** job orchestrates all three methods in sequence: ping firs
 - Tracks discovery history via `DiscoveryScan` and `DiscoveryResult` models
 - Configurable defaults for device location, role, status, and tags
 - Threaded/concurrent scanning for fast results
-- Dry-run mode for SNMP, SSH, and Full jobs
+- Dry-run mode
 - **Network Device Discovery** — one consolidated, profile-first job: pick a Discovery Profile and the scan scope, protocols, credentials, and Fast Path all come from the profile. Launch it from the profile's **Run Device Discovery** button.
 - **Cable linking** — creates `dcim.Cable` objects from LLDP/CDP neighbor data when both ends can be resolved
 - **Crawl Discovery** — iteratively discovers devices from a seed device by following LLDP/CDP neighbors hop by hop
@@ -51,6 +45,19 @@ Raw walked tables are stored in `DiscoveryResult.discovered_data` so you can rev
 - Python >= 3.9
 - `pysnmp>=4.4` for SNMP queries (both the classic sync API, pysnmp < 7, and the asyncio API, pysnmp >= 7, are supported)
 - `paramiko` for SSH connections
+
+## Compatibility Matrix
+
+| Plugin version | Nautobot versions | Python | Status |
+|----------------|-------------------|--------|--------|
+| 1.1.x | 3.0 – 3.2.x | 3.9 – 3.12 | Supported |
+| 1.0.0 | 3.0 – 3.2.x | 3.9 – 3.12 | Supported (superseded by 1.1.0) |
+| 0.4 – 0.11 | 3.0 – 3.2.x | 3.9 – 3.12 | EOL |
+| 0.3.x and earlier | 3.0 – 3.1 | 3.9+ | EOL |
+
+Databases: PostgreSQL or MySQL (SQLite is not supported by Nautobot).
+The app follows Nautobot's deprecation policy: plugin versions are supported
+for the lifetime of the Nautobot minor versions listed above.
 
 ## Installation
 
@@ -118,55 +125,44 @@ nautobot-server postupgrade
 
 ## Usage
 
-### Ping Sweep
+The plugin provides **five jobs**:
 
-Finds live hosts in a CIDR range:
+| Job | Purpose |
+|-----|---------|
+| **Network Device Discovery** | The consolidated, profile-first discovery job (ping → SNMP → SSH phases driven by a Discovery Profile). |
+| **Sync Discovered Devices From Network** | Refresh already-known discovered devices (no new discovery): re-query over SNMP, then SSH, updating records and correlation status. |
+| **Onboard Discovered Devices** | Create Nautobot Devices from selected Not Imported discovered devices. |
+| **Crawl Discovery** | Iteratively discover devices from a seed device by following LLDP/CDP neighbors. |
+| **VRF & Route Discovery** | Extract VRFs, route prefixes, and IP addresses into IPAM. |
 
-1. Navigate to **Plugins > Device Auto-Discovery > Ping Sweep** (or **Jobs > Ping Sweep**)
-2. Enter target network (e.g., `10.0.0.0/24`)
-3. Configure timeout and concurrency
-4. Run the job
+> **Breaking change (1.0.0):** the standalone **Ping Sweep**, **SNMP Discovery**,
+> **SSH Discovery**, and **Full Discovery** jobs were removed. Their engines live
+> on inside Network Device Discovery — use a Discovery Profile with
+> `protocols: ["snmp"]` or `["ssh"]` to reproduce the old single-protocol jobs.
+> Delete any scheduled jobs referencing the removed classes before upgrading.
 
-### SNMP Discovery
+### Network Device Discovery
 
-Discovers devices via SNMP (v1, v2c, or v3):
+The consolidated, profile-first discovery job:
 
-1. Navigate to **Jobs > SNMP Discovery**
-2. Enter target network
-3. Select the SNMP version:
-   - **`2c` (default)** — provide the community string
-   - **`1`** — same community string, SNMPv1 message format
-   - **`3`** — provide the SNMPv3 USM username and, optionally, auth/priv
-     protocol and passphrase (noAuth/noPriv, authNoPriv, or authPriv are
-     selected automatically based on which keys are supplied) plus an
-     optional context name for v3B / context-engine-ID setups
-4. Optionally toggle **Populate interfaces**, **Populate IP addresses**, **Include neighbors**, **Populate VLANs**, and **Create cables**
-5. Run the job
+1. Create a **Discovery Profile** (prefixes, protocols, credentials, Fast Path)
+2. Open the profile and click **Run Device Discovery**, or run **Jobs > Network Device Discovery** and select the profile
+3. The profile's `protocols` list drives the phase selection — `ping`, `snmp`, and/or `ssh`
+4. Optionally tick **Dry-run** first to preview what would be discovered
 
-SNMPv3 auth/priv passphrases are treated as sensitive inputs, so the job
-cannot be scheduled or run through an approval workflow. For automated runs,
-set `snmp_version` to `"3"` and the SNMPv3 fields in `PLUGINS_CONFIG` instead.
+Phase behavior:
 
-Devices discovered via SNMP are auto-created in Nautobot. Platform identification is done via SNMP OID matching. Interfaces and IP addresses are created from the walked IF-MIB and IP-MIB tables; the Device serial number comes from ENTITY-MIB when available. VLANs are created from the Q-BRIDGE-MIB `dot1qVlanStaticTable` (ID + name) under a per-device `VLANGroup`. In dry-run mode, no objects are created but all walked table data is captured on the `DiscoveryResult` for review.
-
-### SSH Discovery
-
-Discovers devices via SSH:
-
-1. Navigate to **Jobs > SSH Discovery**
-2. Enter target network
-3. Provide SSH username and password (or leave empty to use plugin config defaults)
-4. Optionally set a non-default **SSH port**
-5. Run the job
-
-For each reachable host, the job opens a PTY-backed interactive shell, disables
-paging, escalates to privileged exec when the login prompt requires it, and runs
-vendor-specific identification commands:
+1. **Ping Sweep** — find live hosts (ICMP, falling back to TCP probes; skipped when `ping` is not in the profile protocols)
+2. **SNMP Discovery** — for live hosts, walk the system scalars plus IF-MIB, IP-MIB, Q-BRIDGE-MIB, ENTITY-MIB, and LLDP/CDP tables. SNMPv1/v2c community or v3 USM (noAuthNoPriv / authNoPriv / authPriv derived from the supplied secrets). Interfaces and IP addresses are created from the walked tables; the Device serial comes from ENTITY-MIB; VLANs are created under a per-device `VLANGroup`.
+3. **SSH Discovery** — for hosts not identified by SNMP, open a PTY-backed shell, disable paging, escalate to privileged exec when required, and run vendor-specific identification commands:
 
 - **Cisco** — `show version` + `show inventory`
+- **Cisco WLC** — `show sysinfo`
 - **Juniper** — `show version` + `show chassis hardware`
 - **Arista / Ubiquiti / EdgeOS** — `show version`
+- **Aruba (AOS-CX/ArubaOS)** — `show version` + `show system`
 - **HPE Comware** — `display version` + `display device manuinfo`
+- **Brocade/Ruckus FastIron** — `show version` + `show chassis`
 - **Nokia SR OS** — `show system version` + `show system information`
 - **FortiGate** — `get system status`
 - **Palo Alto** — `show system info`
@@ -176,36 +172,30 @@ unknown vendors fall back to a generic command list. Raw command output is
 stored on the `DiscoveryResult` (`discovered_data.command_outputs`) for review,
 including in dry-run mode.
 
-> **Recommendation:** Store credentials in Nautobot Secrets (using Environment Variables or Vault provider) and paste the values into the job inputs.
+Then all discovered devices are deduplicated, correlated, and created
+(Manufacturer/DeviceType/Platform auto-created when missing), and
+`dcim.Cable` links are made from LLDP/CDP neighbor data (when `create_cables`
+is enabled).
 
-### Network Device Discovery
+### Sync Discovered Devices From Network
 
-The consolidated, profile-first job (recommended for recurring scans):
+A refresh job for devices Nautobot **already knows about** — the recurring
+companion to discovery:
 
-1. Create a **Discovery Profile** (prefixes, protocols, credentials, Fast Path)
-2. Open the profile and click **Run Device Discovery**, or run **Jobs > Network Device Discovery** and select the profile
-3. The profile's `protocols` list drives the phase selection — `ping`, `snmp`, and/or `ssh`
-4. Optionally tick **Dry-run** first to preview what would be discovered
+1. Run **Jobs > Sync Discovered Devices From Network**
+2. Optionally select a Discovery Profile (bounds the sync to its prefixes and
+   supplies Secrets Group credentials) and/or narrow by correlation status
+3. Optionally tick **Dry-run**
 
-The job reuses the Full Discovery engine (batched SNMP, per-phase concurrency, Fast Path, correlation, cable linking), so the two are interchangeable — this one just cannot run without a profile.
+For each selected device the job attempts SNMP first, then SSH (preferring
+the device's stored last-known-working Secrets Group). Records, correlation
+status, and per-protocol collection timestamps are updated in place — **no
+new DiscoveredDevice rows are ever created**. A device that answers neither
+protocol is marked Not Reachable; a stored-credentials SSH failure clears the
+stored SSH state so the next run re-discovers (Fast Path self-correction).
 
-### Full Discovery
-
-Runs all three methods in sequence:
-
-1. Navigate to **Jobs > Full Discovery**
-2. Enter target network
-3. Configure SNMP version/community (or SNMPv3 USM credentials) and SSH credentials
-4. Toggle which methods to enable (ping / SNMP / SSH) and whether to populate interfaces, IP addresses, VLANs, and cables
-5. Run the job
-
-The job will:
-1. Ping the range to find live hosts
-2. Run SNMP on live hosts
-3. Run SSH on hosts not identified by SNMP
-4. Deduplicate results
-5. Create devices in Nautobot
-6. Create `dcim.Cable` links from the LLDP/CDP neighbor data (when `create_cables` is enabled)
+Schedule discovery + sync together: discovery finds what changed on the
+network; sync keeps known devices fresh between scans.
 
 ### Crawl Discovery
 
@@ -334,7 +324,7 @@ hostname, or serial) is linked rather than duplicated.
 
 ### Fast Path
 
-Fast Path optimizes recurring **Full Discovery** scans in mature environments
+Fast Path optimizes recurring **Network Device Discovery** scans in mature environments
 where devices rarely change. It applies only to the SSH collection phase —
 SNMP always runs the same way.
 

@@ -6,7 +6,6 @@ from django.test import TestCase
 
 from nautobot_plugin_device_auto_discovery.jobs import (
     FullDiscoveryJob,
-    SNMPDiscoveryJob,
     _apply_configured_time_limits,
     _iter_snmp_batches,
     _run_snmp_scan_batches,
@@ -120,11 +119,9 @@ class TimeLimitConfigurationTests(TestCase):
                 _apply_configured_time_limits()
                 self.assertEqual(FullDiscoveryJob.soft_time_limit, 7200)
                 self.assertEqual(FullDiscoveryJob.time_limit, 7500)
-                self.assertEqual(SNMPDiscoveryJob.soft_time_limit, 7200)
             finally:
                 FullDiscoveryJob.soft_time_limit = original_full
                 FullDiscoveryJob.time_limit = 3600
-                SNMPDiscoveryJob.soft_time_limit = 600
 
     def test_invalid_ratio_ignored(self):
         with patch(
@@ -180,12 +177,14 @@ class FullJobBatchIntegrationTests(TestCase):
     def test_full_job_runs_with_batching(self):
         from nautobot.extras.test_tools import run_job_for_testing
 
+        from nautobot_plugin_device_auto_discovery.jobs import NetworkDeviceDiscoveryJob
+
         def fake_snmp(ip_str, config):
             return self._snmp_info(ip_str)
 
         with patch("nautobot_plugin_device_auto_discovery.jobs.snmp_discover_device", side_effect=fake_snmp):
             result = run_job_for_testing(
-                FullDiscoveryJob,
+                NetworkDeviceDiscoveryJob,
                 data={
                     "target_network": "10.11.0.0/29",
                     "profile": self.profile,

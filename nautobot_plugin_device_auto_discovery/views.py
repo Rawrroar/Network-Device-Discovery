@@ -95,7 +95,6 @@ class DiscoveryProfileUIViewSet(NautobotUIViewSet):
                     "snmpv3_priv_protocol",
                     "fast_path",
                     "strip_domain_suffixes",
-                    "secrets_groups",
                 ),
             ),
         ),

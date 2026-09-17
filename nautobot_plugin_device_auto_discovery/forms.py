@@ -2,7 +2,6 @@
 
 from django import forms
 from nautobot.apps.forms import NautobotBulkEditForm, NautobotFilterForm, NautobotModelForm
-from nautobot.extras.models import SecretsGroup
 
 from nautobot_plugin_device_auto_discovery import models
 
@@ -66,11 +65,6 @@ class DiscoveryProfileFilterForm(NautobotFilterForm):
         choices=[("active", "Active"), ("inactive", "Inactive")],
         required=False,
         label="Status",
-    )
-    secrets_groups = forms.ModelMultipleChoiceField(
-        queryset=SecretsGroup.objects.all(),
-        required=False,
-        label="Secrets Groups",
     )
 
 

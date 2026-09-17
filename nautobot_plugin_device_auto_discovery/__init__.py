@@ -39,7 +39,7 @@ DEFAULT_PLUGINS_CONFIG = {
 class DeviceAutoDiscoveryConfig(NautobotAppConfig):
     name = "nautobot_plugin_device_auto_discovery"
     verbose_name = "Device Auto-Discovery"
-    version = "0.11.0"
+    version = "0.11.1"
     author = "Developer"
     author_email = "dev@example.com"
     description = "Automatic network device discovery via ICMP ping, SNMP, and SSH."

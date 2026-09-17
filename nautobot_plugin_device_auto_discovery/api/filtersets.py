@@ -47,7 +47,11 @@ class DiscoveryProfileFilterSet(NautobotFilterSet):
 
     class Meta:
         model = models.DiscoveryProfile
-        fields = ("name", "status", "secrets_groups")
+        # NOTE: the secrets_groups M2M is intentionally NOT filterable —
+        # Nautobot's auto-generated M2M filter for a custom through model
+        # breaks the list-view dynamic filter form (TypeError at render).
+        # Manage credentials via the assignments list view / API instead.
+        fields = ("name", "status")
 
 
 class DiscoveredDeviceFilterSet(NautobotFilterSet):

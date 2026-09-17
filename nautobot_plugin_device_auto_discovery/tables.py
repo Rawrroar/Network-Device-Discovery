@@ -74,7 +74,7 @@ class DiscoveryProfileTable(BaseTable):
 
     class Meta:
         model = models.DiscoveryProfile
-        fields = ("name", "status", "protocols", "included_ip_prefixes", "maximum_ip_addresses", "secrets_groups", "created")
+        fields = ("name", "status", "protocols", "included_ip_prefixes", "maximum_ip_addresses", "created")
         default_columns = ("name", "status", "protocols", "included_ip_prefixes", "created")
 
 

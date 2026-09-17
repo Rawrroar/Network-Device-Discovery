@@ -1,5 +1,17 @@
 # Release Notes
 
+## v1.1.1 - 2026-09
+
+### Fixed
+
+- **`TypeError: 'NoneType' object is not callable` on every plugin list view**
+  (Discovery Profiles, Discovered Devices, etc.). Nautobot's
+  `saved_view_modal` template tag resolves the model's FilterSet via
+  `get_filterset_for_model`, which requires a top-level `filters.py` module
+  with `{Model}FilterSet` classes. The plugin only defined filtersets in
+  `api/filtersets.py`, so the lookup returned `None` and `None()` raised.
+  Added the expected `filters` module re-exporting all filtersets.
+
 ## v1.1.0 — 2026-09
 
 ### Added

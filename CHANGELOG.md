@@ -1,5 +1,17 @@
 # Release Notes
 
+## v1.1.2 - 2026-09
+
+### Fixed
+
+- Discovery Profile form now accepts **comma-separated** values for
+  `included_ip_prefixes` / `excluded_ip_prefixes` / `protocols` /
+  `strip_domain_suffixes` (and the classification rule's IP Scope) instead of
+  requiring strict JSON — e.g. `192.168.1.0/24, 10.0.0.0/8`. JSON arrays and
+  `['...']` shorthand are also accepted, and stored values render back as
+  plain comma-separated text when editing. Invalid prefixes are rejected with
+  a clear message.
+
 ## v1.1.1 - 2026-09
 
 ### Fixed

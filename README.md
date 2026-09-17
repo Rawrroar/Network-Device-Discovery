@@ -220,7 +220,7 @@ A visited set (keyed on IP) plus the depth and device caps keep the crawl finite
 
 `DiscoveryProfile` records provide a reusable bundle of scan scope and settings that the SNMP, Full, and Crawl jobs accept via a **Profile** job input:
 
-- `included_ip_prefixes` — CIDR prefixes to scan (used instead of the `target_network` input when present)
+- `included_ip_prefixes` — CIDR prefixes to scan, comma-separated in the UI (e.g. `192.168.1.0/24, 10.0.0.0/8`; JSON lists also accepted)
 - `excluded_ip_prefixes` — CIDR prefixes to skip
 - `maximum_ip_addresses` — hard cap on the number of hosts scanned (0 = unlimited); the job aborts with an error when exceeded
 - `protocols` — which methods to use (`ping`, `snmp`, `ssh`)

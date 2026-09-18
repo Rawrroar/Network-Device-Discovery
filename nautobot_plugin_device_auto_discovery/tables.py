@@ -1,12 +1,13 @@
 ﻿"""UI tables for the Device Auto-Discovery plugin."""
 
 import django_tables2 as tables
-from nautobot.apps.tables import BaseTable
+from nautobot.apps.tables import BaseTable, ToggleColumn
 
 from nautobot_plugin_device_auto_discovery import models
 
 
 class DiscoveryScanTable(BaseTable):
+    pk = ToggleColumn()
     name = tables.LinkColumn()
     scan_method = tables.Column(verbose_name="Method")
     status = tables.Column()
@@ -38,6 +39,7 @@ class DiscoveryScanTable(BaseTable):
 
 
 class DiscoveryResultTable(BaseTable):
+    pk = ToggleColumn()
     hostname = tables.LinkColumn()
     ip_address = tables.Column(verbose_name="IP Address")
     result_status = tables.Column(verbose_name="Status")
@@ -69,6 +71,7 @@ class DiscoveryResultTable(BaseTable):
 
 
 class DiscoveryProfileTable(BaseTable):
+    pk = ToggleColumn()
     name = tables.LinkColumn()
     status = tables.Column()
 
@@ -79,6 +82,7 @@ class DiscoveryProfileTable(BaseTable):
 
 
 class DiscoveredDeviceTable(BaseTable):
+    pk = ToggleColumn()
     hostname = tables.LinkColumn()
     ip_address = tables.Column(verbose_name="IP Address")
     status = tables.Column(verbose_name="Correlation")
@@ -142,6 +146,7 @@ class DiscoveryProfileSecretsGroupAssignmentTable(BaseTable):
 
 
 class DeviceClassificationRuleTable(BaseTable):
+    pk = ToggleColumn()
     name = tables.LinkColumn()
     classify_as = tables.Column(verbose_name="Classify As")
 

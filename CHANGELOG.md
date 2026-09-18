@@ -1,5 +1,36 @@
 # Release Notes
 
+## v1.1.5 - 2026-09
+
+### Fixed
+
+- **Onboarding/Run-Discovery submission crashed with
+  `NoReverseMatch: 'jobresult_detail'`** after successfully enqueueing the
+  job. Nautobot 3.2.2 has no `jobresult_detail` route; the correct detail
+  route name is `extras:jobresult`. Both redirect targets updated.
+
+## v1.1.4 - 2026-09
+
+### Fixed
+
+- **Onboard form and Run Discovery form pages returned 500**
+  (`AttributeError: 'NoneType' object has no attribute '_meta'`). The two
+  action templates extended `generic/object_detail.html`, whose parent
+  template dereferences an `object` context variable that these standalone
+  action pages do not provide (`object|validated_viewname:"list"` on None).
+  Both templates now extend `base_django.html` directly.
+
+## v1.1.3 - 2026-09
+
+### Fixed
+
+- **Row-selection checkboxes were missing on all list views** (e.g. the
+  "Onboard Selected Devices" action could never find selected devices).
+  Nautobot requires each list table to declare `pk = ToggleColumn()`; the
+  plugin's tables did not, so no checkboxes were rendered. Added the toggle
+  column to DiscoveryScan, DiscoveryResult, DiscoveryProfile,
+  DiscoveredDevice, and DeviceClassificationRule tables.
+
 ## v1.1.2 - 2026-09
 
 ### Fixed

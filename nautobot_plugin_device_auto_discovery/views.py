@@ -146,7 +146,7 @@ class DiscoveryProfileUIViewSet(NautobotUIViewSet):
                     user=request.user,
                     job_kwargs=job_data,
                 )
-                return redirect("extras:jobresult_detail", pk=job_result.pk)
+                return redirect("extras:jobresult", pk=job_result.pk)
 
         return Response(
             {
@@ -331,7 +331,7 @@ class DiscoveredDeviceUIViewSet(NautobotUIViewSet):
                     user=request.user,
                     job_kwargs=job_data,
                 )
-                return redirect("extras:jobresult_detail", pk=job_result.pk)
+                return redirect("extras:jobresult", pk=job_result.pk)
 
         pk_list = ",".join(request.GET.getlist("pk")) or request.POST.get("pk_list", "")
         selected = models.DiscoveredDevice.objects.filter(pk__in=[pk for pk in pk_list.split(",") if pk])

@@ -70,6 +70,11 @@ class DiscoveryScan(PrimaryModel):
         help_text="Error message if the scan failed.",
     )
 
+    # No unique field exists on this model; Nautobot's natural-key
+    # machinery requires an explicit pk-based declaration (see core
+    # VPNTunnelEndpoint for the same pattern).
+    natural_key_field_names = ["pk"]
+
     class Meta:
         ordering = ["-created"]
 
@@ -196,6 +201,9 @@ class DiscoveryResult(PrimaryModel):
         default="",
         help_text="Error details if discovery or creation failed.",
     )
+
+    # (scan, ip_address) can repeat across runs; no natural unique key.
+    natural_key_field_names = ["pk"]
 
     class Meta:
         ordering = ["-created"]

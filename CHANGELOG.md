@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.1.6 - 2026-09
+
+### Fixed
+
+- **Opening a DiscoveryScan or DiscoveryResult detail page raised
+  `AttributeError: Unable to identify an intrinsic natural-key definition`**.
+  Neither model has a unique field/constraint, and Nautobot 3.2's UI
+  framework requires an explicit `natural_key_field_names = ["pk"]` class
+  attribute in that case (same pattern as core's VPNTunnelEndpoint).
+
 ## v1.1.5 - 2026-09
 
 ### Fixed
